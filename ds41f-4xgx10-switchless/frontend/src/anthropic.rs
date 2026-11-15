@@ -13,7 +13,7 @@
 //! - deferred tools (`defer_loading`) stay out of the tool list. A `tool_reference` that loads one is
 //!   rendered in its tool result as the tool's schema, so the prompt's leading tool list stays the
 //!   same for the whole conversation;
-//! - effort: `output_config.effort` low, medium, high, xhigh, max → budget 50, 62, 75, 88, 100;
+//! - effort: `output_config.effort` low and medium → budget 50, high and xhigh → 75, max → 100 (`effort`);
 //! - images become image_url parts with --vision-addr, otherwise a placeholder; other blocks the
 //!   model cannot read (documents, server tool results) become placeholders, never an error.
 
