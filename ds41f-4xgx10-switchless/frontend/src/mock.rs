@@ -240,6 +240,8 @@ fn script(prompt: &str) -> Script {
         text.push_str(&format!("The tool returned: {}", snippet(r, 200)));
     } else if let (Some(p), true) = (last_user.find("MOCK_TOOL "), has_tools) {
         let rest = &last_user[p + "MOCK_TOOL ".len()..];
+        // up to the next special token (a mid-conversation system message can follow the user's text)
+        let rest = rest.split("<｜").next().unwrap_or(rest);
         let (name, args) = rest.split_once(' ').unwrap_or((rest.trim(), "{}"));
         let args: Value = crate::pyjson::loads(args.trim()).unwrap_or(Value::Object(Default::default()));
         text.push_str("Calling the tool.");

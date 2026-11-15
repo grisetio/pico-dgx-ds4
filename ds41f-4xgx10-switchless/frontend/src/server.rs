@@ -87,7 +87,7 @@ impl App {
         }
     }
 
-    fn random_hex(&self, n: usize) -> String {
+    pub(crate) fn random_hex(&self, n: usize) -> String {
         // splitmix64 over time and a counter: ids only need to be unique
         let mut x = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
             ^ self.counter.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15);
@@ -110,6 +110,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route("/v1/messages/count_tokens", post(crate::anthropic::count_tokens))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(app)
 }
@@ -124,7 +126,7 @@ fn error(status: StatusCode, kind: &str, msg: impl Into<String>) -> Response {
 
 /// A request's failure: its status, error type and message. The answer, or once a stream has started
 /// (a stream that waited at the gate), its error event.
-struct ApiError(StatusCode, String, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String, pub(crate) String);
 
 impl ApiError {
     fn json(&self) -> Value {
@@ -136,7 +138,7 @@ impl ApiError {
 }
 
 /// Refused at the gate: 503, with Retry-After as an answer.
-fn refused(r: Refused) -> ApiError {
+pub(crate) fn refused(r: Refused) -> ApiError {
     let msg = match r {
         Refused::Held(t) => format!("the engine has been down for the {} s this request waited (the ring is lent to a development job, or the engine restarts); try again later", t.as_secs()),
         Refused::Closing => "the server is shutting down".into(),
@@ -146,23 +148,28 @@ fn refused(r: Refused) -> ApiError {
 
 /// A stream that waits for the engine carries an SSE comment this often, so that a client's idle
 /// timeout sees bytes (and so does a long prefill's wait for its first token).
-const KEEP_ALIVE: Duration = Duration::from_secs(5);
+pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(5);
 
 fn bad_request(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
-fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Response> {
-    let Some(key) = &app.cfg.api_key else { return Ok(()) };
+/// The key as a bearer token, or in `x-api-key` (Anthropic clients).
+pub(crate) fn key_ok(app: &App, headers: &HeaderMap) -> bool {
+    let Some(key) = &app.cfg.api_key else { return true };
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .map(str::trim)
         .unwrap_or("");
     // constant-time comparison
-    let ok = got.len() == key.len() && got.bytes().zip(key.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-    if ok {
+    got.len() == key.len() && got.bytes().zip(key.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Response> {
+    if key_ok(app, headers) {
         Ok(())
     } else {
         Err(error(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key"))
@@ -185,9 +192,12 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         return r;
     }
     let max_len = app.engine.info().map(|i| i.max_context);
+    // OpenAI's list, with the fields an Anthropic client reads beside them
     let body = json!({"object": "list", "data": [{
         "id": app.cfg.model_name, "object": "model", "created": 0, "owned_by": "dsgb10",
-        "root": app.cfg.model_name, "max_model_len": max_len}]});
+        "root": app.cfg.model_name, "max_model_len": max_len,
+        "type": "model", "display_name": app.cfg.model_name, "created_at": "1970-01-01T00:00:00Z"}],
+        "has_more": false, "first_id": app.cfg.model_name, "last_id": app.cfg.model_name});
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
@@ -455,14 +465,14 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
 // ------------------------------------------------------------------ generation
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Finish {
+pub(crate) enum Finish {
     Stop,
     Length,
     ToolCalls,
 }
 
 impl Finish {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Finish::Stop => "stop",
             Finish::Length => "length",
@@ -471,11 +481,11 @@ impl Finish {
     }
 }
 
-struct Usage {
-    prompt: usize,
-    cached: u32,
-    completion: usize,
-    reasoning: usize,
+pub(crate) struct Usage {
+    pub(crate) prompt: usize,
+    pub(crate) cached: u32,
+    pub(crate) completion: usize,
+    pub(crate) reasoning: usize,
 }
 
 impl Usage {
@@ -488,14 +498,16 @@ impl Usage {
 }
 
 /// One request in flight on the engine: decodes, stops, guards and parses its token stream.
-struct Gen {
+pub(crate) struct Gen {
     app: Arc<App>,
     /// counts the request in flight at the gate until it ends (or its client goes away)
     _pass: Pass,
     req_id: u64,
     session_id: u64,
     prompt_text: String,
-    prompt_ids: Vec<u32>,
+    pub(crate) prompt_ids: Vec<u32>,
+    /// the prefix the session plan expects to reuse; the engine's count comes at the end
+    pub(crate) reused: usize,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
@@ -516,7 +528,7 @@ struct Gen {
 impl Gen {
     /// Feed engine events until something can be sent. Returns the deltas and, at the end, the
     /// finish reason and usage.
-    async fn next(&mut self, out: &mut Vec<Delta>) -> Option<Result<(Finish, Usage), String>> {
+    pub(crate) async fn next(&mut self, out: &mut Vec<Delta>) -> Option<Result<(Finish, Usage), String>> {
         loop {
             let ev = match self.rx.recv().await {
                 Some(ev) => ev,
@@ -649,7 +661,7 @@ impl Drop for Gen {
     }
 }
 
-async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
+pub(crate) async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
     let unavailable = |msg: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg);
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
@@ -715,6 +727,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         req_id,
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
+        reused: plan.reused,
         prompt_ids: plan.ids,
         rx,
         stop_ids,
@@ -790,6 +803,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         req_id,
         session_id,
         prompt_text: p.prompt.clone(),
+        reused: 0,
         prompt_ids: ids,
         rx,
         stop_ids,
@@ -878,7 +892,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
 }
 
 /// The request's record, with --dump-dir.
-fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
+pub(crate) fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
     if let Some(dir) = &app.cfg.dump_dir {
         let rec = json!({"request": req, "prompt": p.prompt, "ids": gen.prompt_ids, "session": gen.session_id, "req_id": gen.req_id});
         if let Err(e) = std::fs::write(dir.join(format!("{:06}.json", gen.req_id)), rec.to_string()) {
