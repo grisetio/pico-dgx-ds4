@@ -19,6 +19,10 @@ struct RankAddr {
   std::string ssh;                 // RANK<r>_SSH: how rank 0's scripts reach it (unused by the engine)
   std::string next_ip[kDomains];   // RANK<r>_NEXT_IP<d>: this rank's address on the link to rank+1
   std::string prev_ip[kDomains];   // RANK<r>_PREV_IP<d>: this rank's address on the link to rank-1
+  // RANK<r>_NEXT_DEV<d>, RANK<r>_PREV_DEV<d> (the fleet's NEXT_DEV<d>, PREV_DEV<d> when absent): this
+  // box's devices facing rank+1 and rank-1, for a ring whose boxes are not all cabled alike (one box's
+  // f0 to the next box's f0, say)
+  std::string next_dev[kDomains], prev_dev[kDomains];
   // RANK<r>_WEIGHTS, _HASHMAP, _ENGRAM (the shards' directory), _SPILL, as written (fleet_path expands
   // them: {rank}, ~/)
   std::string weights, hashmap, engram, spill;
@@ -32,8 +36,8 @@ struct RankAddr {
 struct Fleet {
   std::string file;                // where it was read from
   int gid_index = -1;              // GID_INDEX
-  std::string next_dev[kDomains];  // NEXT_DEV<d>: the device facing rank+1, on every box
-  std::string prev_dev[kDomains];  // PREV_DEV<d>: the device facing rank-1
+  std::string next_dev[kDomains];  // NEXT_DEV<d>: the device facing rank+1, on every box without its own
+  std::string prev_dev[kDomains];  // PREV_DEV<d>: the device facing rank-1, likewise
   RankAddr rank[kRanks];
 };
 

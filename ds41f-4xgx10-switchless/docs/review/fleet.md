@@ -45,6 +45,7 @@ file cut for another rank.
 | Key | Read by | What |
 |---|---|---|
 | `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1` | engine | the RDMA devices facing rank r + 1 (port f0) and r − 1 (port f1), PCI domains 0 and 2, alike on every box |
+| `RANK<r>_NEXT_DEV0`, `_NEXT_DEV1`, `_PREV_DEV0`, `_PREV_DEV1` | engine | optional: the rank's own devices facing r + 1 and r − 1, in place of the fleet's (a ring with like ports joined) |
 | `GID_INDEX` | engine | the RoCE v2 GID index, alike on every device |
 | `RANK<r>_NEXT_IP0`, `_NEXT_IP1`, `_PREV_IP0`, `_PREV_IP1` | engine | the rank's addresses on its two links, per PCI domain; `PREV_IP0` also carries the bootstrap |
 | `RANK<r>_HOSTNAME`, `RANK<r>_NAME` | engine | the rank by hostname, when no `--rank` is given; the box's name in logs (optional) |

@@ -123,7 +123,8 @@ directory, unless a step says otherwise; the times are this project's. Each comm
 - Four GB10 boxes (128 GB each), ranks 0–3, rank 0 reaching the others by SSH without a password,
   cabled as a directed ring of ConnectX-7 links: port f0 of rank r (the fleet file's `NEXT_DEV0` and
   `NEXT_DEV1`, its RDMA devices on PCI domains 0 and 2) to port f1 of rank r + 1 (`PREV_DEV0`,
-  `PREV_DEV1`), and rank 3's f0 to rank 0's f1 ([ring.md](docs/ring.md#the-ring)). A link's ends have IPv4
+  `PREV_DEV1`), and rank 3's f0 to rank 0's f1 ([ring.md](docs/ring.md#the-ring)); a box cabled the other
+  way round names its own devices (`RANK<r>_NEXT_DEV0`, …, below). A link's ends have IPv4
   addresses in a /24 of their own, with RoCE v2 GIDs at one index everywhere (`bash micro/ring_links.sh`).
 - Every box as here: Ubuntu 24.04, kernel 7.0.0-1019-nvidia, driver 580.178.04, rdma-core 50, booted
   with `kho=off`, without which `ibv_reg_mr` fails (`grep -o kho=off /proc/cmdline` shows it; to set it,
@@ -155,6 +156,7 @@ values have no spaces or quotes, and in a path a leading `~/` is the home on the
 |---|---|
 | `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1`, `GID_INDEX` | port f0's RDMA devices on PCI domains 0 and 2 (to rank r + 1), and port f1's (from rank r − 1), the same names on every box; the RoCE v2 GID index of the links' addresses, the same on every device |
 | `BIN_DIR`, `LOG_DIR`, `SERVICE_DIR`, `RING_LOCK` | on every box: the engine and `fleet.conf`, the ranks' logs, service.sh's state; on rank 0, in a directory that exists: the lock every job on the ring holds |
+| `RANK<r>_NEXT_DEV0`, `_NEXT_DEV1`, `_PREV_DEV0`, `_PREV_DEV1` (optional) | the box's own devices facing rank r + 1 and r − 1, in place of the fleet's, for a ring not cabled f0 to f1 throughout (with like ports joined, every other box faces rank r + 1 through f1) |
 | `RANK<r>_NAME`, `RANK<r>_HOSTNAME`, `RANK<r>_SSH` | the box's name in logs (optional); its `hostname`, by which a rank started without `--rank` finds itself; how rank 0 reaches ranks 1–3 (an address, or `user@host`) |
 | `RANK<r>_NEXT_IP0`, `RANK<r>_NEXT_IP1`, `RANK<r>_PREV_IP0`, `RANK<r>_PREV_IP1` | its addresses on the links to rank r + 1 and from rank r − 1, PCI domains 0 and 2; `PREV_IP0` also takes the start's TCP handshake (port 18620) |
 | `RANK<r>_WEIGHTS`, `RANK<r>_HASHMAP`, `RANK<r>_ENGRAM` | its weight file, the Engram hash map, the directory of its two Engram shards (steps 4 and 5); `--weights`, `--hashmap`, `--shard1` and `--shard14` override them |
