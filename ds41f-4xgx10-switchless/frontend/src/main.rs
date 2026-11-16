@@ -24,7 +24,8 @@ fn usage() -> ! {
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
-                                ids (N.out.json; debugging and bench traces)
+                                ids (N.out.json; debugging and bench traces). N goes on after the
+                                highest one DIR holds, so a restart does not overwrite a dump
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release

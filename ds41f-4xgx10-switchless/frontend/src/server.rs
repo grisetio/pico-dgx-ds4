@@ -76,13 +76,29 @@ pub struct App {
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
+    /// The dump files' numbers go on after the highest a dump directory already holds (dump_base):
+    /// the request ids start at 1 with every start.
+    dump_base: u64,
+}
+
+/// The highest number of the `NNNNNN.json` and `NNNNNN.out.json` files in dir (0: none).
+fn dump_base(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.filter_map(|e| {
+        let name = e.ok()?.file_name().into_string().ok()?;
+        let n = name.strip_suffix(".out.json").or_else(|| name.strip_suffix(".json"))?;
+        n.bytes().all(|b| b.is_ascii_digit()).then(|| n.parse::<u64>().ok()).flatten()
+    })
+    .max()
+    .unwrap_or(0)
 }
 
 impl App {
     pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient) -> Arc<App> {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        let dump_base = cfg.dump_dir.as_deref().map_or(0, dump_base);
+        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0), dump_base })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -635,7 +651,7 @@ impl Gen {
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
                             "usage": usage.json(), "ttft_s": ttft, "total_s": total});
-                        if let Err(e) = std::fs::write(dir.join(format!("{:06}.out.json", self.req_id)), rec.to_string()) {
+                        if let Err(e) = std::fs::write(dir.join(format!("{:06}.out.json", self.app.dump_base + self.req_id)), rec.to_string()) {
                             eprintln!("dump: {e}");
                         }
                     }
@@ -920,7 +936,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
 pub(crate) fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
     if let Some(dir) = &app.cfg.dump_dir {
         let rec = json!({"request": req, "prompt": p.prompt, "ids": gen.prompt_ids, "session": gen.session_id, "req_id": gen.req_id});
-        if let Err(e) = std::fs::write(dir.join(format!("{:06}.json", gen.req_id)), rec.to_string()) {
+        if let Err(e) = std::fs::write(dir.join(format!("{:06}.json", app.dump_base + gen.req_id)), rec.to_string()) {
             eprintln!("dump: {e}");
         }
     }
@@ -1051,6 +1067,20 @@ mod tests {
         ] {
             assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
         }
+    }
+
+    #[test]
+    fn dumps_go_on_after_the_last_run() {
+        let dir = std::env::temp_dir().join(format!("dsfront-dumps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(dump_base(&dir), 0);
+        for f in ["000007.json", "000041.out.json", "000040.json", "notes.json", "12a.json", "000099.json.tmp"] {
+            std::fs::write(dir.join(f), "{}").unwrap();
+        }
+        assert_eq!(dump_base(&dir), 41);
+        assert_eq!(dump_base(&dir.join("absent")), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
