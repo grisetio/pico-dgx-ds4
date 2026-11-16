@@ -8,6 +8,9 @@
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
 //! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
+//!
+//! A session's state is its weights' (docs/variants.md): a request matches only the sessions of its
+//! weight variant.
 
 use crate::tokenizer::Tokenizer;
 use std::collections::HashMap;
@@ -32,6 +35,8 @@ struct Session {
     last_used: u64,
     /// Unix time of its last request: a saved table leaves out what is older than its limit.
     t_used: u64,
+    /// The weight variant whose state the engine holds for it (docs/variants.md).
+    variant: u32,
 }
 
 pub struct Plan {
@@ -89,7 +94,9 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0001";
+/// DSFT0002 adds each session's weight variant; a DSFT0001 table's sessions are variant 0's.
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
+const TABLE_MAGIC_V1: &[u8; 8] = b"DSFT0001";
 
 fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -150,7 +157,7 @@ impl SessionTable {
                 continue;
             }
             n += 1;
-            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64] {
+            for v in [id, s.last_used, s.t_used, s.variant as u64, s.prompt_len as u64, s.text.len() as u64] {
                 body.extend(v.to_le_bytes());
             }
             body.extend(s.text.as_bytes());
@@ -208,9 +215,10 @@ impl SessionTable {
         }
         let mut f = Vec::new();
         file.read_to_end(&mut f).map_err(|e| e.to_string())?;
-        if f.len() < 56 || &f[..8] != TABLE_MAGIC {
+        if f.len() < 56 || (&f[..8] != TABLE_MAGIC && &f[..8] != TABLE_MAGIC_V1) {
             return Err("not a saved table".into());
         }
+        let v1 = &f[..8] == TABLE_MAGIC_V1;
         let mut h = Bytes { b: &f[8..56], at: 0 };
         let (written, next_id, clock, n, body_len, hash) = (h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?);
         let now = unix_now();
@@ -224,14 +232,16 @@ impl SessionTable {
         let mut r = Bytes { b: body, at: 0 };
         let mut got = HashMap::new();
         for _ in 0..n {
-            let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
+            let (id, last_used, t_used) = (r.u64()?, r.u64()?, r.u64()?);
+            let variant = if v1 { 0 } else { r.u64()? };
+            let (prompt_len, text_len) = (r.u64()? as usize, r.u64()? as usize);
             let text = r.take(text_len)?;
             let n_ids = r.u64()? as usize;
             let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
             let ids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
             let Ok(text) = std::str::from_utf8(text) else { continue };
             let vocab = tok.vocab_size() as u32;
-            if id == 0 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
+            if id == 0 || variant > u32::MAX as u64 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
                 continue;
             }
             let mut ends = Vec::with_capacity(ids.len());
@@ -243,7 +253,7 @@ impl SessionTable {
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, variant: variant as u32 });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -262,12 +272,13 @@ impl SessionTable {
         id
     }
 
-    /// Choose the session and the token ids for a prompt. The chosen session is busy until
-    /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
-    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+    /// Choose the session and the token ids for a prompt run with weight variant `variant`, among
+    /// that variant's sessions. The chosen session is busy until `finish` or `abandon`. Returns the
+    /// plan and the sessions to RELEASE on the engine.
+    pub fn plan(&mut self, text: &str, variant: u32, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
-        for (&id, s) in &self.sessions {
+        for (&id, s) in self.sessions.iter().filter(|(_, s)| s.variant == variant) {
             let n = common_prefix(text.as_bytes(), s.text.as_bytes());
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
                 top = Some((id, n));
@@ -322,6 +333,7 @@ impl SessionTable {
             busy: false,
             last_used: clock,
             t_used: 0,
+            variant,
         });
         s.busy = true;
         s.last_used = clock;
@@ -397,14 +409,14 @@ mod tests {
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
         let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
-        let (plan, _) = t.plan(&p1, &tok, 1);
+        let (plan, _) = t.plan(&p1, 0, &tok, 1);
         assert_eq!(plan.ids, tok.encode(&p1));
         // the model spelled "Hi there" in single letters, which BPE would never produce
         let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
         gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
         t.finish(plan.session_id, &p1, &plan.ids, &gen, &tok);
         let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = t.plan(&p2, &tok, 1);
+        let (plan2, _) = t.plan(&p2, 0, &tok, 1);
         assert_eq!(plan2.session_id, plan.session_id);
         let mut want = plan.ids.clone();
         want.extend(&gen);
@@ -414,10 +426,31 @@ mod tests {
         assert_eq!(tok.decode(&plan2.ids), p2);
         // the same system prompt in another conversation forks instead of taking over the session
         let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
-        let (plan3, _) = t.plan(&p3, &tok, 1);
+        let (plan3, _) = t.plan(&p3, 0, &tok, 1);
         assert_ne!(plan3.session_id, plan.session_id);
         assert_eq!(plan3.base_session_id, plan.session_id);
         assert_eq!(tok.decode(&plan3.ids), p3);
+    }
+
+    #[test]
+    fn a_variant_matches_its_own_sessions() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (plan, _) = t.plan(p1, 0, &tok, 1);
+        t.finish(plan.session_id, p1, &plan.ids, &tok.encode("Hi."), &tok);
+        let p2 = format!("{p1}Hi.<｜User｜>next<｜Assistant｜></think>");
+        // the other weights' state is not this one's: a new session, no base, nothing reused
+        let (other, _) = t.plan(&p2, 1, &tok, 1);
+        assert_ne!(other.session_id, plan.session_id);
+        assert_eq!((other.base_session_id, other.reused), (0, 0));
+        t.finish(other.session_id, &p2, &other.ids, &tok.encode("Sure."), &tok);
+        // and each goes on with its own
+        let (back, _) = t.plan(&p2, 0, &tok, 1);
+        assert_eq!(back.session_id, plan.session_id);
+        let p3 = format!("{p2}Sure.<｜User｜>more<｜Assistant｜></think>");
+        let (again, _) = t.plan(&p3, 1, &tok, 1);
+        assert_eq!(again.session_id, other.session_id);
     }
 
     #[test]
@@ -430,12 +463,12 @@ mod tests {
             format!("<｜begin▁of▁sentence｜><｜System｜>{body}Current date and time: Monday, October 12, 2026 at {time}\n\n## Tools\n\nnone<｜User｜>{msg}<｜Assistant｜></think>")
         };
         let a = conv("09:14:08 AM", "fix the build");
-        let (pa, _) = t.plan(&a, &tok, 1);
+        let (pa, _) = t.plan(&a, 0, &tok, 1);
         assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares a byte", pa.session_id));
         t.finish(pa.session_id, &a, &pa.ids, &tok.encode("Done."), &tok);
         // another conversation, a minute later: a fork of the first, which has every id before the time
         let b = conv("09:15:31 AM", "write the tests");
-        let (pb, _) = t.plan(&b, &tok, 1);
+        let (pb, _) = t.plan(&b, 0, &tok, 1);
         assert_eq!(pb.base_session_id, pa.session_id);
         assert_eq!(pb.ids, tok.encode(&b), "the ids are a cold run's");
         let head = tok.encode(&b[..b.find("09:15").unwrap()]).len();
@@ -445,13 +478,13 @@ mod tests {
         assert!(d.ends_with(&format!("of {} bytes, {} ids in common", b.len(), pb.common)), "{d}");
         // the next turn of the first: in place
         let a2 = format!("{a}Done.<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜></think>");
-        let (pa2, _) = t.plan(&a2, &tok, 1);
+        let (pa2, _) = t.plan(&a2, 0, &tok, 1);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
         t.finish(pa2.session_id, &a2, &pa2.ids, &tok.encode("Sure."), &tok);
         // a prompt that shares only the BOS and a few bytes: a new session, which names no base
         let c = "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>";
-        let (pc, _) = t.plan(c, &tok, 1);
+        let (pc, _) = t.plan(c, 0, &tok, 1);
         assert_eq!(pc.base_session_id, 0);
         let n = common_prefix(c.as_bytes(), a.as_bytes());
         assert!(n > 0 && n < MIN_SHARED);
@@ -469,10 +502,10 @@ mod tests {
         let path = dir.join("front.table");
         let mut t = SessionTable::new(8, 1 << 20);
         let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
-        let (plan, _) = t.plan(p1, &tok, 1);
+        let (plan, _) = t.plan(p1, 0, &tok, 1);
         let gen = tok.encode("Hi there.");
         t.finish(plan.session_id, p1, &plan.ids, &gen, &tok);
-        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &tok, 1);
+        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", 0, &tok, 1);
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir(repo.join("run")).unwrap();
@@ -489,7 +522,7 @@ mod tests {
         assert!(!path.exists(), "the file goes once read");
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
         let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = u.plan(&p2, &tok, 1);
+        let (plan2, _) = u.plan(&p2, 0, &tok, 1);
         assert_eq!(plan2.session_id, plan.session_id);
         assert_eq!(plan2.reused, plan.ids.len() + gen.len());
         assert_eq!(tok.decode(&plan2.ids), p2);

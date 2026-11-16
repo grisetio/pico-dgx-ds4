@@ -23,9 +23,9 @@ struct RankAddr {
   // box's devices facing rank+1 and rank-1, for a ring whose boxes are not all cabled alike (one box's
   // f0 to the next box's f0, say)
   std::string next_dev[kDomains], prev_dev[kDomains];
-  // RANK<r>_WEIGHTS, _HASHMAP, _ENGRAM (the shards' directory), _SPILL, as written (fleet_path expands
-  // them: {rank}, ~/)
-  std::string weights, hashmap, engram, spill;
+  // RANK<r>_WEIGHTS, _HASHMAP, _ENGRAM (the shards' directory), _SPILL, _VARIANT (a weight variant's rank
+  // file, optional: --variant), as written (fleet_path expands them: {rank}, ~/)
+  std::string weights, hashmap, engram, spill, variant;
   // RANK<r>_ENGRAM_READ_BATCH (1 when absent): the Engram store submits its SSD reads in multiples of
   // this, padded with discarded reads (engram::StoreConfig::read_batch): 8 for an SSD that signals
   // completions 8 at a time. It moves no result.

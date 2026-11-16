@@ -50,6 +50,22 @@ pub struct ServerConfig {
     pub hold: Duration,
     /// vision: the image encoder's address (host:port); None: image input is refused as before
     pub vision_addr: Option<String>,
+    /// The model name whose requests run on the engine's weight variant (docs/variants.md); None: one model
+    pub variant_model: Option<String>,
+}
+
+impl ServerConfig {
+    /// The weight variant a request's model name runs on: 1 for variant_model, else 0.
+    pub fn variant_of(&self, model: Option<&str>) -> u32 {
+        (model.is_some() && model == self.variant_model.as_deref()) as u32
+    }
+    /// The model name of weight variant v.
+    pub fn name_of(&self, v: u32) -> &str {
+        match (&self.variant_model, v) {
+            (Some(m), 1) => m,
+            _ => &self.model_name,
+        }
+    }
 }
 
 pub struct App {
@@ -193,11 +209,15 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
     let max_len = app.engine.info().map(|i| i.max_context);
     // OpenAI's list, with the fields an Anthropic client reads beside them
-    let body = json!({"object": "list", "data": [{
-        "id": app.cfg.model_name, "object": "model", "created": 0, "owned_by": "dsgb10",
-        "root": app.cfg.model_name, "max_model_len": max_len,
-        "type": "model", "display_name": app.cfg.model_name, "created_at": "1970-01-01T00:00:00Z"}],
-        "has_more": false, "first_id": app.cfg.model_name, "last_id": app.cfg.model_name});
+    let names: Vec<&str> = std::iter::once(app.cfg.model_name.as_str()).chain(app.cfg.variant_model.as_deref()).collect();
+    let data: Vec<Value> = names
+        .iter()
+        .map(|n| {
+            json!({"id": n, "object": "model", "created": 0, "owned_by": "dsgb10", "root": n, "max_model_len": max_len,
+                   "type": "model", "display_name": n, "created_at": "1970-01-01T00:00:00Z"})
+        })
+        .collect();
+    let body = json!({"object": "list", "data": data, "has_more": false, "first_id": names[0], "last_id": names[names.len() - 1]});
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
@@ -221,6 +241,8 @@ pub struct Prepared {
     pub ignore_eos: bool,
     /// vision: the image records in prompt order (encoding.py's), one per placeholder; empty for text
     pub images: Vec<Value>,
+    /// the weight variant its model name runs on (ServerConfig::variant_of)
+    pub variant: u32,
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
@@ -459,6 +481,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         stop_ids,
         ignore_eos,
         images,
+        variant: cfg.variant_of(r.get("model").and_then(Value::as_str)),
     })
 }
 
@@ -671,10 +694,10 @@ pub(crate) async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Ge
     }
     let (plan, released) = {
         let app2 = app.clone();
-        let text = p.prompt.clone();
+        let (text, variant) = (p.prompt.clone(), p.variant);
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            t.plan(&text, variant, &app2.tok, app2.cfg.tokenize_threads)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -708,6 +731,7 @@ pub(crate) async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Ge
         flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
+        variant: p.variant,
         stop_ids: stop_ids.clone(),
         prompt: plan.ids.clone(),
         images: None,
@@ -785,6 +809,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: 0,
+        variant: p.variant,
         stop_ids: stop_ids.clone(),
         prompt: ids.clone(),
         images: Some(crate::vision::payload(&starts, &enc)),
@@ -858,7 +883,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     dump(&app, &req, &p, &gen);
     let id = format!("chatcmpl-{}", app.random_hex(24));
     let created = now_secs();
-    let model = app.cfg.model_name.clone();
+    let model = app.cfg.name_of(p.variant).to_string();
     // non-streaming
     let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
     let mut out = Vec::new();
@@ -938,7 +963,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         dump(&app, &req, &p, &gen);
         let id = format!("chatcmpl-{}", app.random_hex(24));
         let created = now_secs();
-        let model = app.cfg.model_name.clone();
+        let model = app.cfg.name_of(p.variant).to_string();
         let chunk = |delta: Value, finish: Option<&str>| {
             json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                    "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}]})
@@ -1005,6 +1030,7 @@ mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            variant_model: None,
         }
     }
 
@@ -1025,6 +1051,17 @@ mod tests {
         ] {
             assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
         }
+    }
+
+    #[test]
+    fn a_model_name_picks_its_weights() {
+        let c = ServerConfig { variant_model: Some("v".into()), ..cfg() };
+        let req = |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(prepare(&c, &req("v")).unwrap().variant, 1);
+        assert_eq!(prepare(&c, &req("m")).unwrap().variant, 0);
+        assert_eq!(prepare(&c, &json!({"messages": [{"role": "user", "content": "hi"}]})).unwrap().variant, 0);
+        assert_eq!(prepare(&cfg(), &req("v")).unwrap().variant, 0, "no variant: every name is the one model");
+        assert_eq!((c.name_of(0), c.name_of(1), cfg().name_of(1)), ("m", "v", "m"));
     }
 
     #[test]

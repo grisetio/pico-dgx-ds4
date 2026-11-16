@@ -60,6 +60,8 @@ pub struct Submit {
     pub flags: u32,
     pub n_top_logprobs: u32,
     pub prefix_hint: u32,
+    /// 0: the engine's bound weights; 1: its weight variant (docs/variants.md)
+    pub variant: u32,
     pub stop_ids: Vec<u32>,
     pub prompt: Vec<u32>,
     /// vision: the image part after prompt[] (with FLAG_IMAGES); None for text
@@ -161,7 +163,7 @@ impl Frame {
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
-                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(0);
+                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(s.variant);
                 w.u32s(&s.stop_ids).u32s(&s.prompt);
                 if let Some(img) = &s.images {
                     w.0.extend_from_slice(img);
@@ -235,7 +237,7 @@ impl Frame {
                 let prefix_hint = r.u32()?;
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
-                r.u32()?;
+                let variant = r.u32()?;
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
                 Frame::Submit(Submit {
@@ -250,6 +252,7 @@ impl Frame {
                     flags,
                     n_top_logprobs,
                     prefix_hint,
+                    variant,
                     stop_ids,
                     prompt,
                     images: None,
@@ -369,6 +372,7 @@ mod tests {
             flags: FLAG_SEED | FLAG_KEEP,
             n_top_logprobs: 0,
             prefix_hint: 5,
+            variant: 1,
             stop_ids: vec![1],
             prompt: vec![0, 10, 20],
             images: None,
@@ -376,6 +380,7 @@ mod tests {
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt
         assert_eq!(u32::from_le_bytes(b[8 + 64..8 + 68].try_into().unwrap()), 3); // n_prompt at offset 64
+        assert_eq!(u32::from_le_bytes(b[8 + 68..8 + 72].try_into().unwrap()), 1); // variant at offset 68
         assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s));
         let d = Done {
             req_id: 1,

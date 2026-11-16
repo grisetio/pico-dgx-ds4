@@ -69,6 +69,7 @@ Fleet read_fleet(const std::string& file) {
     keys[p + "ENGRAM"] = &R.engram;
     keys[p + "ENGRAM_READ_BATCH"] = &read_batch[r];
     keys[p + "SPILL"] = &R.spill;
+    keys[p + "VARIANT"] = &R.variant;
   }
   std::map<std::string, int> seen;
   std::string line;

@@ -444,6 +444,7 @@ fn convert(req: &Value, vision: bool, counting: bool) -> Result<Converted, Strin
     }
     chat.insert("stream".into(), json!(truthy(r.get("stream"))));
     let model = r.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    chat.insert("model".into(), json!(model));  // the weight variant it names (ServerConfig::variant_of)
     Ok(Converted { chat: Value::Object(chat), omit_thinking, model })
 }
 

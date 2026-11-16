@@ -55,7 +55,10 @@
 //                together, a row each per step (one alone: with drafts). --slice N: a request that
 //                comes while others decode pauses them and is prefilled; while more requests decode
 //                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
-//                request that would need the slot of another in flight waits for one to free)
+//                request that would need the slot of another in flight waits for one to free).
+//                --variant FILE (default the fleet file's RANK<r>_VARIANT, if any): a weight variant
+//                (docs/variants.md), a rank file of another checkpoint's attn.wo_b tensors, held beside the
+//                bound ones; a request that names it (SubmitHeader::variant 1) runs with them in place
 //   generate --loop: the generation runs through the decode loop (same tokens as without)
 //   --spec: DSpark drafts (mtp.* loaded) in the decode loop (decode, generate --loop; serve runs them
 //     unless --no-spec: they change the speed, never the tokens), at most
@@ -304,6 +307,7 @@ struct Args {
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
+  std::string variant;        // --variant FILE: a weight variant's rank file (serve; docs/variants.md)
   int spec_drafts = 5;
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
@@ -325,6 +329,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--golden") a.golden = val();
     else if (s == "--weights") a.weights = val();
     else if (s == "--draft-weights") a.draft_weights = val();
+    else if (s == "--variant") a.variant = val();
     else if (s == "--hashmap") a.hashmap = val();
     else if (s == "--shard1") a.shard[0] = val();
     else if (s == "--shard14") a.shard[1] = val();
@@ -470,6 +475,8 @@ Args parse(int argc, char** argv) {
     path(a.shard[1], dir.empty() ? "" : dir + "/engram-l14-r" + r + "of4.bin", "ENGRAM", "--shard14");
   }
   if (a.mode == "serve") path(a.disk_dir, me.spill, "SPILL", "--disk-dir");
+  if (a.mode == "serve") a.variant = comm::fleet_path(a.variant.empty() ? me.variant : a.variant, a.rank);
+  else if (!a.variant.empty()) die("--variant: serve only");
   a.engram_read_batch = me.engram_read_batch;
   // steps of one session hold at most kMaxSessRows rows (config.h); a step of up to kMaxRows takes several sessions
   if (a.chunk < 1 || a.chunk > model::kMaxSessRows || a.k < 1 || a.k > model::kMaxSessRows)
@@ -635,6 +642,17 @@ int main(int argc, char** argv) {
                 ds.seconds);
   }
   if (a.spec) m.bind_spec(wf, dwf.get());
+  // --variant: its attn.wo_b tensors stay in their own arena, exchanged with the bound ones per request
+  std::unique_ptr<dsw::WeightFile> vwf;
+  if (!a.variant.empty()) {
+    vwf = std::make_unique<dsw::WeightFile>(a.variant, a.rank, comm::kRanks);
+    dsw::LoadOptions vlo;
+    vlo.threads = a.threads;
+    const dsw::LoadStats vs = vwf->load(vlo);
+    m.bind_variant(*vwf);
+    std::printf("rank %d: variant %s: %zu tensors, %.2f GiB in %.1f s\n", a.rank, a.variant.c_str(), vwf->tensors().size(),
+                vs.bytes / 1073741824.0, vs.seconds);
+  }
   if (!a.head_raw) {  // after bind_spec: DSpark's FP8 head comes from the raw one
     const double t1 = now_s();
     int raw = 0;

@@ -369,12 +369,14 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  uint32_t variant = 0;  // the weights its state was computed with (docs/variants.md)
 };
 
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
-// history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '1'};
+// history, encoder-only snapshots, weight variant. An index of S1 (before weight variants) reads as variant 0.
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '2'};
+constexpr char kSrvMagicV1[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '1'};
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
@@ -465,7 +467,8 @@ class Server {
       : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {}
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
-  // one is there), then the front-end's frames, then a run of the requests decoding (run).
+  // one is there), then those that waited for their weight variant (once nothing runs), then the
+  // front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
       sweep();
@@ -478,12 +481,14 @@ class Server {
         Request rq = std::move(wait_.front());
         wait_.pop_front();
         admit(std::move(rq));
+      } else if (!vwait_.empty() && idle()) {
+        next_variant();
       } else if (io_.pop(e, rot_.empty() ? 250 : 0)) {
         if (e.release) {
           if (flying_.count(e.session)) later_.insert(e.session);
           else release(e.session);
         } else if (!e.rq.conn->dead) {  // a gone front-end's requests need no answer
-          admit(std::move(e.rq));
+          take(std::move(e.rq));
         }
       } else if (!rot_.empty()) {
         run();
@@ -491,7 +496,7 @@ class Server {
     }
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
     sweep();
-    for (std::deque<Request>* d : {&ready_, &held_, &wait_}) {
+    for (std::deque<Request>* d : {&ready_, &held_, &wait_, &vwait_}) {
       for (const Request& rq : *d) done(rq, fe::kCancelled, 0, 0, now_s(), 0), Io::forget(rq);
       d->clear();
     }
@@ -519,12 +524,16 @@ class Server {
       // why: "" when there is none
     } else if (!gen) {
       why = "the store did not reuse its files";
-    } else if (f.size() < sizeof hd || std::memcmp(hd.magic, kSrvMagic, sizeof kSrvMagic) != 0 || hd.gen != gen ||
+    } else if (f.size() < sizeof hd ||
+               (std::memcmp(hd.magic, kSrvMagic, sizeof kSrvMagic) != 0 &&
+                std::memcmp(hd.magic, kSrvMagicV1, sizeof kSrvMagicV1) != 0) ||
+               hd.gen != gen ||
                hd.body_bytes != f.size() - sizeof hd ||
                keepfile::fnv(f.data() + sizeof hd, hd.body_bytes) != hd.body_hash || hd.n_sess < 0) {
       why = "the index is not of the stop whose files the store reused";
     } else {
       keepfile::Reader r{f.data() + sizeof hd, (size_t)hd.body_bytes};
+      const bool v1 = std::memcmp(hd.magic, kSrvMagicV1, sizeof kSrvMagicV1) == 0;
       const double wall = unix_now();
       for (int i = 0; i < hd.n_sess && r.ok; ++i) {
         const uint64_t id = r.get<uint64_t>();
@@ -542,7 +551,9 @@ class Server {
         for (int32_t& t : s.hist) t = r.get<int32_t>();
         s.enc_snaps.resize(ne);
         for (int& e : s.enc_snaps) e = r.get<int32_t>();
-        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= o_.keep_age_s;
+        s.variant = v1 ? 0 : r.get<uint32_t>();
+        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= o_.keep_age_s &&
+                  s.variant <= (uint32_t)m_.variants();
         for (const int32_t t : s.hist) ok = ok && t >= 0 && t < model::kVocab;
         const model::Model::StateInfo si = m_.state_info(s.h);
         ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh;
@@ -655,6 +666,7 @@ class Server {
       put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
       for (const int32_t t : s.hist) put<int32_t>(f, t);
       for (const int e : s.enc_snaps) put<int32_t>(f, e);
+      put<uint32_t>(f, s.variant);
     }
     SrvHeader hd{};
     std::memcpy(hd.magic, kSrvMagic, sizeof kSrvMagic);
@@ -862,6 +874,40 @@ class Server {
     if (!err.empty()) std::printf("serve: request %llu: %s\n", (unsigned long long)rq.h.req_id, err.c_str());
   }
 
+  // A submit from the front-end: refused when it names a weight variant this engine lacks; waiting when it
+  // names another than the bound one, or others wait (then it waits its turn too); else admitted.
+  void take(Request&& rq) {
+    if (rq.h.variant > (uint32_t)m_.variants()) {
+      done(rq, fe::kError, 0, 0, now_s(), 0, "this engine has no weight variant " + std::to_string(rq.h.variant));
+      return Io::forget(rq);
+    }
+    if (!vwait_.empty() || rq.h.variant != variant_) return vwait_.push_back(std::move(rq));
+    admit(std::move(rq));
+  }
+  // Nothing in flight, paused, held or waiting: a weight variant may change.
+  bool idle() const { return rot_.empty() && flying_.empty() && held_.empty() && ready_.empty() && wait_.empty(); }
+  // The first waiting request's weight variant bound on every rank (when another), and the requests that
+  // wait for it admitted, in order. The swap: ~400 MB of device copies per rank and the prefill's gather
+  // (Model::set_variant).
+  void next_variant() {
+    const uint32_t v = vwait_.front().h.variant;
+    if (v != variant_) {
+      const double t0 = now_s();
+      Cmd c{};
+      c.op = kCmdVariant;
+      c.n = (int32_t)v;
+      wd_.started = now_s();
+      issue(c);
+      m_.set_variant((int)v);
+      wd_.started = 0;
+      variant_ = v;
+      std::printf("serve: weight variant %u bound in %.1f ms\n", v, 1e3 * (now_s() - t0));
+    }
+    for (auto it = vwait_.begin(); it != vwait_.end();)
+      if (it->h.variant == v) ready_.push_back(std::move(*it)), it = vwait_.erase(it);
+      else ++it;
+  }
+
   // A submit: held while its session is in flight (a session's requests run one at a time); waiting while
   // no slot can be had (every slot's session in flight, and no time-slicing); else started.
   void admit(Request&& rq) {
@@ -944,9 +990,11 @@ class Server {
 
     // ---- the slot, where the state comes from, and from which position on it is computed
     Session* S = find(h.session_id);
+    if (S && S->variant != variant_) release(h.session_id), S = nullptr;  // its state is another weights'
     Session* src = S;
     uint64_t src_id = h.session_id;
     if (!S && h.base_session_id) src = find(h.base_session_id), src_id = h.base_session_id;
+    if (src && src->variant != variant_) src = nullptr;
     // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
     // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
     // state goes to the store, and the fork starts from there in a slot of its own.
@@ -1001,6 +1049,7 @@ class Server {
     if (!S) {
       Session ns;
       ns.h = next_h_++;
+      ns.variant = variant_;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
     }
     if (src) {
@@ -1465,16 +1514,18 @@ class Server {
   }
 
   // Paused requests that their client cancelled, or that the server's stop ends, end now, not at their
-  // turn; so do requests waiting for a slot.
+  // turn; so do requests waiting for a slot or a weight variant.
   void sweep() {
-    for (auto it = wait_.begin(); it != wait_.end();) {
-      if (!Io::cancelled(*it)) {
-        ++it;
-        continue;
+    for (std::deque<Request>* d : {&wait_, &vwait_}) {
+      for (auto it = d->begin(); it != d->end();) {
+        if (!Io::cancelled(*it)) {
+          ++it;
+          continue;
+        }
+        done(*it, fe::kCancelled, 0, 0, now_s(), 0);
+        Io::forget(*it);
+        it = d->erase(it);
       }
-      done(*it, fe::kCancelled, 0, 0, now_s(), 0);
-      Io::forget(*it);
-      it = wait_.erase(it);
     }
     for (size_t i = 0; i < rot_.size();) {
       if (!Io::cancelled(rot_[i].rq)) {
@@ -1556,6 +1607,8 @@ class Server {
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
+  std::deque<Request> vwait_;  // submits waiting for their weight variant (next_variant), in order
+  uint32_t variant_ = 0;       // the weight variant bound (Model::set_variant)
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end
   int next_h_ = 1;
   uint64_t clock_ = 0;

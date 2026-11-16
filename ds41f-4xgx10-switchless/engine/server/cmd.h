@@ -68,6 +68,8 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  // Model::set_variant(n): weight variant n's tensors in place (docs/variants.md), between requests
+  kCmdVariant = 22,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {

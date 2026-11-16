@@ -13,6 +13,8 @@ fn usage() -> ! {
       --engine-socket PATH      /tmp/dsgb10-engine.sock
       --api-key-file PATH       require this bearer key (the file's content, trimmed)
       --model-name NAME         deepseek-v4.1-flash-uncensored
+      --variant-model NAME      requests naming this model run on the engine's weight variant
+                                (its --variant; docs/variants.md); every other name on its weights
       --max-tokens N            default and cap for max_tokens: 32768
       --effort N                reasoning effort budget when a request names none: 75
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
@@ -120,6 +122,7 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
+        variant_model: opt(args, "--variant-model"),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);

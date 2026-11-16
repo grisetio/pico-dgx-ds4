@@ -402,6 +402,55 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   bound = true;
 }
 
+// The weight variant's tensors, checked against what bind bound: each a loaded layer's attn.wo_b.weight of the
+// same shape, already in the L1 layout the kernels read (the converter's), so that the exchange is a copy.
+void Model::Impl::bind_variant(dsw::WeightFile& wf) {
+  if (!bound) die("variant: bind the weights first");
+  if (pf) die("variant: bind it before prefill_init");
+  if (!var_wob.empty()) die("variant: one at most");
+  var_tmp = dalloc<uint8_t>((size_t)kDim * kOPart);  // set_variant's exchange buffer; the tiling's scratch here
+  for (const dsw::DeviceTensor& t : wf.tensors()) {
+    int L = -1, end = 0;
+    const char* n = t.name.c_str();
+    if (std::sscanf(n, "layers.%d.attn.wo_b.weight%n", &L, &end) != 1 || end != (int)t.name.size())
+      die("variant: %s is not a layer's attn.wo_b.weight", n);
+    if (L < opt.first_layer || L >= opt.n_layers) die("variant: %s is of a layer this rank does not run", n);
+    if (t.dtype != dsw::DType::F8_E4M3 || t.ndim != 2 || t.shape[0] != kDim || t.shape[1] != kOPart)
+      die("variant: %s is not [%d][%d] e4m3", n, kDim, kOPart);
+    if (!t.data) die("variant: %s is not loaded", n);
+    for (const auto& [l, p] : var_wob)
+      if (l == L) die("variant: %s twice", n);
+    uint8_t* d = static_cast<uint8_t*>(t.data);
+    if (t.layout == dsw::Layout::Natural) {  // tiled here, as bind does
+      dsk::tile_fp8(d, var_tmp, kDim, kOPart, st);
+      CUDA_CHECK(cudaMemcpyAsync(d, var_tmp, (size_t)kDim * kOPart, cudaMemcpyDeviceToDevice, st));
+    } else if (t.layout != dsw::Layout::L1) {
+      die("variant: %s is %s, expected L1", n, dsw::layout_name(t.layout));
+    }
+    var_wob.emplace_back(L, d);
+  }
+  if (var_wob.empty()) die("variant: the file holds no tensor");
+  CUDA_CHECK(cudaStreamSynchronize(st));
+}
+
+void Model::Impl::set_variant(int v) {
+  if (v < 0 || v > (var_wob.empty() ? 0 : 1)) die("model: no weight variant %d", v);
+  if (v == cur_variant) return;
+  CUDA_CHECK(cudaDeviceSynchronize());  // no kernel of any stream reads them meanwhile
+  const size_t b = (size_t)kDim * kOPart;
+  for (const auto& [L, other] : var_wob) {
+    uint8_t* live = const_cast<uint8_t*>(lw[L].wob);
+    CUDA_CHECK(cudaMemcpyAsync(var_tmp, live, b, cudaMemcpyDeviceToDevice, st));
+    CUDA_CHECK(cudaMemcpyAsync(live, other, b, cudaMemcpyDeviceToDevice, st));
+    CUDA_CHECK(cudaMemcpyAsync(other, var_tmp, b, cudaMemcpyDeviceToDevice, st));
+    // the prefill path's copy of every rank's slice (prefill_alloc), gathered again: every rank exchanges
+    // the same layers in the same order
+    if (pf) comm::allgather(ch, live, pf->pl[L].wob, b, st);
+  }
+  CUDA_CHECK(cudaStreamSynchronize(st));
+  cur_variant = v;
+}
+
 // The head's coding: made beside the head, decoded and compared with it in full, then copied over it (the
 // weight file's arena cannot give back the rest of the slot). Every reader moves at once: the head GEMVs
 // here and in prefill.cu by head_coded, DSpark's bf16 head by spec_head_coded (its FP8 copy, made in bind_spec, is
@@ -1212,6 +1261,10 @@ Model::Model(int rank, const Options& opt) : d_(std::make_unique<Impl>(rank, opt
 Model::~Model() = default;
 void Model::bind(dsw::WeightFile& wf, comm::Ring& ring) { d_->bind(wf, ring); }
 void Model::bind_ring2(comm::Ring& ring) { d_->ch2 = ring.dev(), d_->has_ch2 = true; }
+void Model::bind_variant(dsw::WeightFile& wf) { d_->bind_variant(wf); }
+int Model::variants() const { return d_->var_wob.empty() ? 0 : 1; }
+void Model::set_variant(int v) { d_->set_variant(v); }
+int Model::variant() const { return d_->cur_variant; }
 size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
 void Model::use_slot(int s) { d_->use_slot(s); }
 int Model::slot() const { return d_->cur_slot; }

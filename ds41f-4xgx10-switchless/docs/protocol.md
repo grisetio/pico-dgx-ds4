@@ -60,7 +60,7 @@ struct SubmitHeader {            // 72 bytes
   uint32_t prefix_hint;          // prompt tokens the front-end expects to match the session
   uint32_t n_stop_ids;           // token ids that end generation (the front-end sends EOS here)
   uint32_t n_prompt;             // >= 1
-  uint32_t reserved;
+  uint32_t variant;              // 0 the bound weights, 1 the weight variant (docs/variants.md)
 };
 
 struct DoneHeader {              // 56 bytes

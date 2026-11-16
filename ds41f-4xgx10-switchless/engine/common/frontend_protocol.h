@@ -67,7 +67,7 @@ struct SubmitHeader {
   uint32_t prefix_hint;      // prompt tokens the front-end expects to match the session (advisory)
   uint32_t n_stop_ids;       // ids that end generation (EOS is in here)
   uint32_t n_prompt;         // >= 1
-  uint32_t reserved;
+  uint32_t variant;          // 0: the weights the engine bound; 1: its weight variant (--variant, docs/variants.md)
 };
 
 struct Cancel {

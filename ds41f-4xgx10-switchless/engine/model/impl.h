@@ -231,6 +231,11 @@ struct Model::Impl {
   dsk::GemvCfg c8k{1, 1, 8}, c8{1, 1, 16}, cwoa{1, 4, 4}, cgate{1, 1, 8}, chead{2, 1, 16};
 
   std::unique_ptr<detail::Prefill> pf;
+  // the weight variant (bind_variant): (layer, its attn.wo_b) for each layer it changes, holding whichever of
+  // the two versions is not in place; the one in place (0: the bound file's); a tensor's room for the exchange
+  std::vector<std::pair<int, uint8_t*>> var_wob;
+  int cur_variant = 0;
+  uint8_t* var_tmp = nullptr;
   std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
@@ -257,6 +262,8 @@ struct Model::Impl {
 
   // ---- weights ------------------------------------------------------------------------------
   void bind(dsw::WeightFile& wf, comm::Ring& ring);
+  void bind_variant(dsw::WeightFile& wf);
+  void set_variant(int v);
   size_t code_head(int* raw_tiles);
 
   // ---- session slots ------------------------------------------------------------------------

@@ -155,6 +155,17 @@ class Model {
   // and all-gathers the mHC projections. Collective: every rank calls it.
   void bind(dsw::WeightFile& wf, comm::Ring& ring);
   void bind_ring2(comm::Ring& ring);  // --wave-probe
+  // A weight variant (docs/variants.md): another checkpoint's attn.wo_b of some layers, from a rank file that
+  // holds only those tensors, laid out as the bound file's (L1). Its bytes stay in wf's arena (wf outlives the
+  // model's use of it), which set_variant exchanges with the bound ones. Every rank binds the same layers,
+  // after bind and before prefill_init. One variant at most.
+  void bind_variant(dsw::WeightFile& wf);
+  int variants() const;  // 1 with a variant bound, else 0
+  // Variant v's weights (0: the bound file's) in place of the current ones, for every kernel and graph (they
+  // read the same addresses): the bytes exchanged, and the prefill path's gathered copies of them gathered
+  // again. Collective, between requests (nothing queued); the KV a session holds is the weights' it ran on.
+  void set_variant(int v);
+  int variant() const;
   // The vocab head coded in place (dsk::bf16x_encode: each tile of 8 rows x 32 values with its exponents as
   // 4-bit offsets, 3/4 of the bytes; checked against the head before it replaces it): every reader of the
   // head moves to the coded GEMVs, which give the same bits. After bind and bind_spec (DSpark's FP8 copy is
