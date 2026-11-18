@@ -89,7 +89,7 @@ gr8_stop() {  # the head's orderly stop of every rank, then the containers (rest
 cmd_hold() {
   echo $$ > "$HOLDER_PID"
   echo waiting > "$HOLDER_STATE"
-  OWNER="glm-5.3 (switch.sh)" LOCK_WAIT=$RING_WAIT_S ring_take "glm-5.3 (switch.sh): gr8 on $GLM_BOXES" || {
+  OWNER="glm-5.3 (switch.sh)" LOCK_WAIT=$RING_WAIT_S ring_take "gr8 on $GLM_BOXES" || {
     rm -f "$HOLDER_STATE" "$HOLDER_PID"
     exit 1
   }
