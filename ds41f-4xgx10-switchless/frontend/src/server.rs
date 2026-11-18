@@ -55,12 +55,34 @@ pub struct ServerConfig {
     pub variant_model: Option<String>,
     /// The GLM-5.3 backend (gr8, docs/glm.md): its model names go there; None: DeepSeek only
     pub glm: Option<crate::glm::GlmConfig>,
+    /// Model names that run on whichever engine family is loaded (docs/glm.md): stock, and uncensored
+    /// (DeepSeek's variant, GLM with the steering profile). None: no alias
+    pub active_alias: Option<String>,
+    pub active_alias_uncensored: Option<String>,
 }
 
 impl ServerConfig {
     /// The weight variant a request's model name runs on: 1 for variant_model, else 0.
     pub fn variant_of(&self, model: Option<&str>) -> u32 {
         (model.is_some() && model == self.variant_model.as_deref()) as u32
+    }
+    /// The model name an active-engine alias stands for on family `f`.
+    pub fn alias_target(&self, f: Family, uncensored: bool) -> &str {
+        match (f, &self.glm) {
+            (Family::Glm, Some(g)) => if uncensored { &g.steered_model } else { &g.model },
+            _ if uncensored => self.variant_model.as_deref().unwrap_or(&self.model_name),
+            _ => &self.model_name,
+        }
+    }
+    /// Some(uncensored) when `model` is an active-engine alias.
+    pub fn alias_of(&self, model: &str) -> Option<bool> {
+        if Some(model) == self.active_alias.as_deref() {
+            Some(false)
+        } else if Some(model) == self.active_alias_uncensored.as_deref() {
+            Some(true)
+        } else {
+            None
+        }
     }
     /// The model name of weight variant v.
     pub fn name_of(&self, v: u32) -> &str {
@@ -192,6 +214,29 @@ pub(crate) fn refused(r: Refused) -> ApiError {
     ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg)
 }
 
+/// The model an active-engine alias names now: whichever family is loaded, or being switched to
+/// (switch.rs `alias_family`), so that it never causes a switch.
+pub(crate) fn resolve_alias(app: &App, model: &str) -> Option<String> {
+    let uncensored = app.cfg.alias_of(model)?;
+    let f = app.switcher().map_or(Family::DeepSeek, |s| s.alias_family());
+    let to = app.cfg.alias_target(f, uncensored).to_string();
+    eprintln!("alias: {model} -> {to} (the {} engine)", f.name());
+    Some(to)
+}
+
+/// The request body with an active-engine alias resolved (None: it names none). The body is read
+/// only when it holds an alias's name.
+pub(crate) fn alias_body(app: &App, body: &Bytes) -> Option<Bytes> {
+    let names = [app.cfg.active_alias.as_deref(), app.cfg.active_alias_uncensored.as_deref()];
+    if !names.into_iter().flatten().any(|n| !n.is_empty() && body.windows(n.len()).any(|w| w == n.as_bytes())) {
+        return None;
+    }
+    let mut req: Value = serde_json::from_slice(body).ok()?;
+    let to = resolve_alias(app, req.get("model")?.as_str()?)?;
+    req["model"] = json!(to);
+    Some(Bytes::from(serde_json::to_vec(&req).ok()?))
+}
+
 /// With engine switching, a DeepSeek request's admission to its engine if it needs no wait: Ok(None)
 /// without switching, Ok(Some) admitted, Err(()) it has to wait (`ds_admit`).
 pub(crate) fn ds_try(app: &App) -> Result<Option<Ticket>, ()> {
@@ -244,7 +289,14 @@ async fn health(State(app): State<Arc<App>>) -> Response {
         let line = sw.status();
         match (sw.switching(), sw.active()) {
             (Some(_), _) | (None, None) => return (StatusCode::SERVICE_UNAVAILABLE, format!("{line}\n")).into_response(),
-            (None, Some(Family::Glm)) => return (StatusCode::OK, format!("ok (glm) {line}\n")).into_response(),
+            (None, Some(Family::Glm)) => {
+                let url = &app.cfg.glm.as_ref().expect("glm configured").url;
+                return if crate::glm::health(url, Duration::from_secs(2)).await {
+                    (StatusCode::OK, format!("ok (glm) {line}\n")).into_response()
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, format!("the GLM engine does not answer at {url}; {line}\n")).into_response()
+                };
+            }
             (None, Some(Family::DeepSeek)) => {}
         }
     }
@@ -262,18 +314,34 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
-    let max_len = app.engine.info().map(|i| i.max_context);
+    let max_len = app.engine.info().map(|i| i.max_context as u64);
     // OpenAI's list, with the fields an Anthropic client reads beside them
-    let glm = app.cfg.glm.as_ref().map(|g| [g.model.as_str(), g.steered_model.as_str()]);
-    let names: Vec<&str> =
-        std::iter::once(app.cfg.model_name.as_str()).chain(app.cfg.variant_model.as_deref()).chain(glm.into_iter().flatten()).collect();
+    let ds = std::iter::once(app.cfg.model_name.as_str()).chain(app.cfg.variant_model.as_deref()).map(|n| (n, max_len));
+    let glm = match &app.cfg.glm {
+        None => Vec::new(),
+        Some(g) => {
+            let len = crate::glm::max_model_len(g).await;
+            vec![(g.model.as_str(), len), (g.steered_model.as_str(), len)]
+        }
+    };
+    let mut names: Vec<(&str, Option<u64>)> = ds.chain(glm).collect();
+    // the active-engine aliases, with the window of what they name now
+    let f = app.switcher().map_or(Family::DeepSeek, |s| s.alias_family());
+    for (a, unc) in [(&app.cfg.active_alias, false), (&app.cfg.active_alias_uncensored, true)] {
+        if let Some(a) = a {
+            let to = app.cfg.alias_target(f, unc);
+            let len = names.iter().find(|x| x.0 == to).and_then(|x| x.1);
+            names.push((a.as_str(), len));
+        }
+    }
     let data: Vec<Value> = names
         .iter()
-        .map(|n| {
-            json!({"id": n, "object": "model", "created": 0, "owned_by": "dsgb10", "root": n, "max_model_len": max_len,
+        .map(|(n, len)| {
+            json!({"id": n, "object": "model", "created": 0, "owned_by": "dsgb10", "root": n, "max_model_len": len,
                    "type": "model", "display_name": n, "created_at": "1970-01-01T00:00:00Z"})
         })
         .collect();
+    let names: Vec<&str> = names.iter().map(|x| x.0).collect();
     let body = json!({"object": "list", "data": data, "has_more": false, "first_id": names[0], "last_id": names[names.len() - 1]});
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
@@ -907,6 +975,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
+    let body = alias_body(&app, &body).unwrap_or(body);
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
@@ -1125,6 +1194,8 @@ mod tests {
             vision_addr: None,
             variant_model: None,
             glm: None,
+            active_alias: None,
+            active_alias_uncensored: None,
         }
     }
 
@@ -1170,6 +1241,41 @@ mod tests {
         assert_eq!(prepare(&c, &json!({"messages": [{"role": "user", "content": "hi"}]})).unwrap().variant, 0);
         assert_eq!(prepare(&cfg(), &req("v")).unwrap().variant, 0, "no variant: every name is the one model");
         assert_eq!((c.name_of(0), c.name_of(1), cfg().name_of(1)), ("m", "v", "m"));
+    }
+
+    #[test]
+    fn active_engine_aliases_name_the_loaded_family() {
+        let glm = crate::glm::GlmConfig {
+            url: "http://127.0.0.1:8100".into(),
+            upstream_model: "glm-5.3".into(),
+            model: "glm-5.3".into(),
+            steered_model: "glm-5.3-jspark".into(),
+            profile: "ablit-behavior-v1".into(),
+            scale: 1.0,
+            default_effort: "high".into(),
+            small_max_tokens: 4096,
+            small_budget: 1024,
+            small_budget_share: 0.5,
+            head_wait: Duration::from_secs(3),
+            min_room: 1024,
+        };
+        let c = ServerConfig {
+            model_name: "deepseek-v4.1-flash".into(),
+            variant_model: Some("deepseek-v4.1-flash-heretic".into()),
+            glm: Some(glm),
+            active_alias: Some("local-active".into()),
+            active_alias_uncensored: Some("local-active-uncensored".into()),
+            ..cfg()
+        };
+        assert_eq!((c.alias_of("local-active"), c.alias_of("local-active-uncensored"), c.alias_of("glm-5.3")), (Some(false), Some(true), None));
+        assert_eq!(c.alias_target(Family::DeepSeek, false), "deepseek-v4.1-flash");
+        assert_eq!(c.alias_target(Family::DeepSeek, true), "deepseek-v4.1-flash-heretic");
+        assert_eq!(c.alias_target(Family::Glm, false), "glm-5.3");
+        assert_eq!(c.alias_target(Family::Glm, true), "glm-5.3-jspark");
+        // without a variant, the uncensored alias is DeepSeek's one model
+        let c = ServerConfig { variant_model: None, ..c };
+        assert_eq!(c.alias_target(Family::DeepSeek, true), "deepseek-v4.1-flash");
+        assert_eq!(cfg().alias_of("local-active"), None, "no alias unless configured");
     }
 
     #[test]

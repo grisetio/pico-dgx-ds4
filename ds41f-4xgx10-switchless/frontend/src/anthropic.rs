@@ -570,6 +570,7 @@ fn parse(app: &App, headers: &HeaderMap, body: &Bytes, counting: bool) -> Result
 }
 
 pub async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let body = if key_ok(&app, &headers) { crate::server::alias_body(&app, &body).unwrap_or(body) } else { body };
     let (_, _, p) = match parse(&app, &headers, &body, true) {
         Ok(x) => x,
         Err(r) => return r,
@@ -583,6 +584,8 @@ pub async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body:
 }
 
 pub async fn messages(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    // an active-engine alias names whichever engine is loaded (server.rs `resolve_alias`)
+    let body = if key_ok(&app, &headers) { crate::server::alias_body(&app, &body).unwrap_or(body) } else { body };
     // the GLM backend's model names go to gr8 (glm.rs)
     if let Some(g) = &app.cfg.glm {
         if key_ok(&app, &headers) {

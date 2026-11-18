@@ -50,8 +50,8 @@ pub type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub trait Driver: Send + Sync + 'static {
     fn run(&self, to: Family, from: Option<Family>) -> BoxFut<Result<(), String>>;
     fn ready(&self, f: Family) -> BoxFut<bool>;
-    /// Why no switch may start now (None: it may).
-    fn blocked(&self) -> Option<String> {
+    /// Why no switch away from `from` may start now (None: it may).
+    fn blocked(&self, _from: Option<Family>) -> Option<String> {
         None
     }
 }
@@ -98,8 +98,10 @@ impl Driver for CmdDriver {
         }
     }
 
-    fn blocked(&self) -> Option<String> {
-        self.gate.held().then(|| "the ring is lent to a development job".to_string())
+    /// While DeepSeek is active, a held gate is the ring lent to a development job: no switch until it
+    /// is back. From GLM, the held gate is GLM's own lend (switch.sh runs gr8 as a ring job).
+    fn blocked(&self, from: Option<Family>) -> Option<String> {
+        (from == Some(Family::DeepSeek) && self.gate.held()).then(|| "the ring is lent to a development job".to_string())
     }
 }
 
@@ -222,19 +224,56 @@ impl Switcher {
             waiting(Family::Glm),
             s.switches,
             s.failed.as_ref().map_or(String::new(), |(f, t, e)| format!(" last_failure {} {} s ago: {e}", f.name(), t.elapsed().as_secs()))
-        ) + &self.driver.blocked().map_or(String::new(), |b| format!(" blocked: {b}"))
+        ) + &self.driver.blocked(s.active).map_or(String::new(), |b| format!(" blocked: {b}"))
     }
 
-    /// Why the ring may not be lent to a job now (gate.rs `hold`): unless the DeepSeek engine is active
-    /// and nothing waits for the other one.
+    /// The family a request naming an active-engine alias runs on (server.rs `resolve_alias`): one that
+    /// never causes a switch. The engine being switched to; else the active one if a request of its
+    /// family would pass now; else the family a waiting request is about to switch to; else the active
+    /// one (DeepSeek when none is).
+    pub fn alias_family(&self) -> Family {
+        let s = self.st.lock().unwrap();
+        if let Some(t) = s.switching {
+            return t;
+        }
+        if let Some(a) = s.active.filter(|&a| self.admissible(&s, None, a)) {
+            return a;
+        }
+        if let Some(q) = s.queue.iter().find(|q| Some(q.1) != s.active) {
+            return q.1;
+        }
+        s.active.unwrap_or(Family::DeepSeek)
+    }
+
+    /// The engine of family `f` stopped answering while active (gr8 crashed): it is no longer taken
+    /// for running, so the next request for it runs the switch command again (which starts it) once
+    /// the requests in flight are done.
+    pub fn lost(&self, f: Family, why: &str) {
+        let mut s = self.st.lock().unwrap();
+        if s.active == Some(f) && s.switching.is_none() {
+            eprintln!("switch: the {} engine is lost ({why}); the next request for it runs the switch command", f.name());
+            s.active = None;
+            drop(s);
+            self.wake.notify_waiters();
+        }
+    }
+
+    /// Why the ring may not be lent now (gate.rs `hold`). It may while DeepSeek is active and nothing
+    /// waits for GLM (to a development job), and while a switch to GLM runs or GLM is active (to gr8:
+    /// switch.sh runs it as a ring job). Not during a switch to DeepSeek, nor while a GLM request
+    /// waits for its turn (requests first).
     pub fn lend_refusal(&self) -> Option<String> {
         let s = self.st.lock().unwrap();
-        let ok = s.active == Some(Family::DeepSeek) && s.switching.is_none() && !s.queue.iter().any(|q| q.1 != Family::DeepSeek);
-        (!ok).then(|| format!("engine switching: {}", self.status_of(&s)))
+        let ok = match (s.switching, s.active) {
+            (Some(Family::Glm), _) | (None, Some(Family::Glm)) => true,
+            (None, Some(Family::DeepSeek)) => !s.queue.iter().any(|q| q.1 != Family::DeepSeek),
+            _ => false,
+        };
+        (!ok).then(|| format!("engine switching: active {} switching {}", name(s.active), name(s.switching)))
     }
 
     fn status_of(&self, s: &St) -> String {
-        format!("active {} switching {}{}", name(s.active), name(s.switching), self.driver.blocked().map_or(String::new(), |b| format!(", blocked: {b}")))
+        format!("active {} switching {}{}", name(s.active), name(s.switching), self.driver.blocked(s.active).map_or(String::new(), |b| format!(", blocked: {b}")))
     }
 
     fn in_dwell(&self, s: &St) -> bool {
@@ -323,7 +362,7 @@ impl Switcher {
     }
 
     fn start_switch(self: &Arc<Self>, s: &mut St, to: Family, why: &str) {
-        if let Some(b) = self.driver.blocked() {
+        if let Some(b) = self.driver.blocked(s.active) {
             if s.blocked.as_deref() != Some(b.as_str()) {
                 eprintln!("switch: {} -> {} waits: {b}", name(s.active), to.name());
                 s.blocked = Some(b);
@@ -435,8 +474,8 @@ mod tests {
         fn ready(&self, _: Family) -> BoxFut<bool> {
             Box::pin(async { true })
         }
-        fn blocked(&self) -> Option<String> {
-            self.block.lock().unwrap().clone()
+        fn blocked(&self, from: Option<Family>) -> Option<String> {
+            self.block.lock().unwrap().clone().filter(|_| from == Some(Family::DeepSeek))
         }
     }
 
@@ -574,5 +613,56 @@ mod tests {
         let e = sw.admit(Family::Glm).await.err().unwrap();
         assert!(e.contains("waited 0 s for the glm engine") && e.contains("blocked: held"), "{e}");
         assert!(sw.status().contains("glm 0"));
+    }
+
+    #[tokio::test]
+    async fn the_alias_follows_the_engine_and_never_switches() {
+        let (sw, fake) = setup(0);
+        assert_eq!(sw.alias_family(), Family::DeepSeek);
+        let d = sw.try_admit(Family::DeepSeek).unwrap();
+        // a GLM request waits for the drain: the switch is coming, the alias goes with it
+        let sw2 = sw.clone();
+        let g = tokio::spawn(async move { sw2.admit(Family::Glm).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(sw.alias_family(), Family::Glm);
+        drop(d);
+        // during the switch: the engine being switched to
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sw.switching(), Some(Family::Glm));
+        assert_eq!(sw.alias_family(), Family::Glm);
+        g.await.unwrap().unwrap();
+        assert_eq!(sw.alias_family(), Family::Glm);
+        // an alias request resolved so passes at once: no switch back
+        let t = sw.try_admit(sw.alias_family()).expect("the alias's family passes");
+        drop(t);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(*fake.log.lock().unwrap(), ["deepseek->glm"]);
+        // a failed switch leaves no engine: DeepSeek
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = sw.admit(Family::DeepSeek).await;
+        assert_eq!((sw.active(), sw.alias_family()), (None, Family::DeepSeek));
+    }
+
+    #[tokio::test]
+    async fn the_ring_is_lent_to_gr8_during_a_switch_to_glm_and_a_dev_job_only_from_an_idle_deepseek() {
+        let (sw, fake) = setup(0);
+        assert_eq!(sw.lend_refusal(), None, "DeepSeek idle: a development job may have it");
+        let d = sw.try_admit(Family::DeepSeek).unwrap();
+        let sw2 = sw.clone();
+        let g = tokio::spawn(async move { sw2.admit(Family::Glm).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(sw.lend_refusal().is_some(), "a GLM request waits: not to a job");
+        drop(d);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sw.switching(), Some(Family::Glm));
+        assert_eq!(sw.lend_refusal(), None, "the switch lends it to gr8");
+        g.await.unwrap().unwrap();
+        // GLM active with the gate held (its own lend): the switch back is not blocked
+        *fake.block.lock().unwrap() = Some("held".into());
+        assert!(sw.status().find("blocked").is_none());
+        let t = sw.admit(Family::DeepSeek).await.unwrap();
+        drop(t);
+        // DeepSeek active and the gate held: that is a development job's lend, which blocks
+        assert!(sw.status().contains("blocked: held"));
     }
 }

@@ -41,10 +41,18 @@ fn usage() -> ! {
       --glm-steered-model NAME  glm-5.3-jspark: these go to gr8 with the steering profile
       --glm-steering-profile P  ablit-behavior-v1    --glm-steering-scale S   1.0
       --glm-upstream-model NAME the name gr8 serves: glm-5.3
-      --glm-effort E            effort when a thinking request names none: low, high or max (high)
-      --glm-small-max-tokens N  a request up to this max_tokens (or thinking off, or with stop
-                                sequences) is small: 4096
-      --glm-small-budget N      a small request's thinking budget, added to its max_tokens: 1024
+      --glm-effort E            effort when a thinking request names none (or none): low, high or max (high)
+      --active-alias NAME       local-active: runs on whichever engine is loaded (DeepSeek's model or
+                                glm-5.3), so it never switches engines; '' for none
+      --active-alias-uncensored NAME
+                                local-active-uncensored: the same, for DeepSeek's variant or the
+                                steered GLM name; '' for none
+      --glm-small-max-tokens N  a request up to this max_tokens (or with thinking disabled, or with
+                                stop sequences) is small: 4096. GLM-5.3 always thinks; a small request
+                                gets low effort (with thinking disabled) and a thinking budget of
+      --glm-small-budget N      at most N tokens (1024)
+      --glm-small-budget-share F  and at most this share of its max_tokens (0.5), so that the answer
+                                fits in the rest
       --glm-min-room N          the least room for an answer; less is \"prompt is too long\": 1024
       --glm-head-wait-ms N      a stream waits this long for gr8's first answer before it starts
                                 with pings (an answer in time can still be an HTTP error): 3000
@@ -135,7 +143,7 @@ fn serve(args: &[String]) {
     if api_key.is_none() {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
-    let cfg = ServerConfig {
+    let mut cfg = ServerConfig {
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         api_key,
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
@@ -167,14 +175,27 @@ fn serve(args: &[String]) {
             },
             small_max_tokens: parse_opt(args, "--glm-small-max-tokens", 4096u64),
             small_budget: parse_opt(args, "--glm-small-budget", 1024u64).max(1),
+            small_budget_share: parse_opt(args, "--glm-small-budget-share", 0.5f64).clamp(0.0, 0.95),
             head_wait: std::time::Duration::from_millis(parse_opt(args, "--glm-head-wait-ms", 3000u64)),
             min_room: parse_opt(args, "--glm-min-room", 1024u64).max(1),
         }),
+        active_alias: None,
+        active_alias_uncensored: None,
     };
+ let alias = |flag: &str, default: &str| -> Option<String> {
+        cfg.glm.as_ref()?;
+        Some(opt(args, flag).unwrap_or_else(|| default.into())).filter(|n| !n.is_empty())
+    };
+    cfg.active_alias = alias("--active-alias", "local-active");
+    cfg.active_alias_uncensored = alias("--active-alias-uncensored", "local-active-uncensored");
     if let Some(g) = &cfg.glm {
-        let ds = [Some(cfg.model_name.as_str()), cfg.variant_model.as_deref()];
-        if g.model == g.steered_model || ds.contains(&Some(g.model.as_str())) || ds.contains(&Some(g.steered_model.as_str())) {
-            eprintln!("--glm-model and --glm-steered-model must differ from each other and from the DeepSeek names");
+        let names: Vec<&str> = [Some(cfg.model_name.as_str()), cfg.variant_model.as_deref(), Some(&g.model), Some(&g.steered_model)]
+            .into_iter()
+            .chain([cfg.active_alias.as_deref(), cfg.active_alias_uncensored.as_deref()])
+            .flatten()
+            .collect();
+        if (1..names.len()).any(|i| names[..i].contains(&names[i])) {
+            eprintln!("the model names must all differ: {names:?}");
             std::process::exit(2);
         }
         dsfront::glm::GlmConfig::check_url(&g.url).unwrap_or_else(|e| {
@@ -338,6 +359,27 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 }
 
 /// Every value of a repeatable option.
+fn mock_gr8(args: &[String]) {
+    let listen = opt(args, "--listen").unwrap_or_else(|| "127.0.0.1:8100".into());
+    let cfg = dsfront::mockgr8::MockGr8Config {
+        ready_after: std::time::Duration::from_secs_f64(parse_opt(args, "--ready-after-s", 0f64)),
+        max_context: parse_opt(args, "--max-context", 202752u64),
+        delay: std::time::Duration::from_millis(parse_opt(args, "--delay-ms", 2u64)),
+        prefill_tps: parse_opt(args, "--prefill-tps", 50000f64),
+        profiles: opts(args, "--steering-profile"),
+        dump_dir: opt(args, "--dump-dir").map(Into::into),
+        served: vec!["glm-5.3".into(), "glm53".into()],
+    };
+    runtime().block_on(async move {
+        let l = tokio::net::TcpListener::bind(&listen).await.unwrap_or_else(|e| {
+            eprintln!("cannot listen on {listen}: {e}");
+            std::process::exit(1)
+        });
+        eprintln!("mock gr8 on http://{listen}");
+        axum::serve(l, dsfront::mockgr8::router(cfg)).await.expect("mock gr8");
+    });
+}
+
 fn opts(args: &[String], name: &str) -> Vec<String> {
     args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
 }
@@ -542,6 +584,7 @@ fn main() {
         Some("enccheck") => enccheck(&args),
         Some("serve") => serve(&args),
         Some("mock-engine") => mock_engine(&args),
+        Some("mock-gr8") => mock_gr8(&args),
         Some("admin") => admin(&args),
         Some("tokenize") => {
             let path = args.get(2).unwrap_or_else(|| usage());

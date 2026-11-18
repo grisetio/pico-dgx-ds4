@@ -50,3 +50,6 @@ The official weights stay the default; a client switches by naming another model
 - A switch drains the engine first, so mixed traffic of both models runs in alternating batches.
 - The drafter (DSpark/MTP) is the bound model's; its acceptance may be lower on the variant (speed only: drafts
   never change the tokens).
+
+Another model family on the same endpoint, GLM-5.3 on gr8, with engine switching between the families and
+the same waiting rule: [glm.md](glm.md).

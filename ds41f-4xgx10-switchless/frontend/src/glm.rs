@@ -6,8 +6,9 @@
 //!   fallback (max) never applies by accident;
 //! - `clear_thinking: false`: every replayed assistant turn keeps its reasoning (the template's default,
 //!   pinned), so a tool loop's reasoning stays in the prompt and the prompt grows only at its end;
-//! - small requests (thinking off, a small max_tokens, or stop sequences: Claude Code's titles and other
-//!   background calls) get a thinking budget and that much more max_tokens, since GLM-5.3 always thinks;
+//! - small requests (thinking disabled, a small max_tokens, or stop sequences: Claude Code's titles and
+//!   other background calls) get low effort and a thinking budget that leaves room for the answer within
+//!   their max_tokens: GLM-5.3 always thinks, and only the budget bounds it;
 //! - stop sequences are matched here, on the visible text only: gr8 would match them in the reasoning too;
 //! - a prompt over the window comes back as "prompt is too long", Claude Code's cue to compact; a prompt
 //!   that fits but leaves too little room for max_tokens is retried once with max_tokens cut to the room.
@@ -41,10 +42,12 @@ pub struct GlmConfig {
     pub scale: f64,
     /// effort when a thinking request names none
     pub default_effort: String,
-    /// a request with max_tokens up to this (or thinking off, or stop sequences) is small
+    /// a request with max_tokens up to this (or thinking disabled, or stop sequences) is small
     pub small_max_tokens: u64,
-    /// a small request's thinking budget, added to its max_tokens
+    /// a small request's thinking budget: at most this many tokens...
     pub small_budget: u64,
+    /// ...and at most this share of its max_tokens, so that the answer has the rest
+    pub small_budget_share: f64,
     /// how long a stream waits for gr8's first answer before it starts with pings
     pub head_wait: Duration,
     /// the least room for the answer: a prompt that leaves less is "too long"
@@ -176,6 +179,26 @@ pub async fn health_json(url: &str, timeout: Duration) -> Option<Value> {
     r.ok().flatten()
 }
 
+/// gr8's context window from its /v1/models (None while it does not answer; remembered after).
+pub async fn max_model_len(cfg: &GlmConfig) -> Option<u64> {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let got = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut u = send(&cfg.url, "GET", "/v1/models", String::new()).await.ok()?;
+        let v: Value = serde_json::from_slice(&u.read_all(1 << 20).await.ok()?).ok()?;
+        v["data"].as_array()?.iter().find(|m| m["id"] == cfg.upstream_model.as_str())?["max_model_len"].as_u64()
+    })
+    .await
+    .ok()
+    .flatten();
+    match got {
+        Some(n) => {
+            SEEN.store(n, std::sync::atomic::Ordering::Relaxed);
+            Some(n)
+        }
+        None => Some(SEEN.load(std::sync::atomic::Ordering::Relaxed)).filter(|&n| n > 0),
+    }
+}
+
 pub async fn health(url: &str, timeout: Duration) -> bool {
     health_json(url, timeout).await.is_some()
 }
@@ -216,12 +239,13 @@ impl SseData {
 
 // ------------------------------------------------------------------ request → gr8 chat request
 
-/// Claude Code's effort level as GLM-5.3's. The template names Low and High, and renders Max for any
-/// other value, unset included; gr8 snaps other names to the nearest of the three. Every level is
-/// mapped here explicitly, so a name neither side knows becomes the default, never Max by accident.
+/// Claude Code's effort level as GLM-5.3's. The template names Low, High and Max; gr8 takes Max when
+/// a request names none. Every level is mapped here explicitly: low → low, medium and high → high,
+/// xhigh and max → max; none, missing or a name neither side knows → the default (high), never Max
+/// by accident.
 pub fn effort(v: Option<&Value>, default: &str) -> String {
     match v.and_then(Value::as_str) {
-        None => default.to_string(),
+        None | Some("none") => default.to_string(),
         Some("low") => "low".into(),
         Some("medium") | Some("high") => "high".into(),
         Some("xhigh") | Some("max") => "max".into(),
@@ -284,26 +308,30 @@ pub fn to_gr8(req: &Value, cfg: &GlmConfig, steered: bool) -> Result<Plan, Strin
     if let Some(schema) = r.get("output_config").and_then(|o| o.get("format")).filter(|f| f.get("type").and_then(Value::as_str) == Some("json_schema")).and_then(|f| f.get("schema")) {
         chat.insert("response_format".into(), json!({"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}));
     }
-    let effort_v = r.get("output_config").and_then(|o| o.get("effort"));
-    let level = if thinking_on { effort(effort_v, &cfg.default_effort) } else { "low".into() };
+    // GLM-5.3 always thinks: its template has no thinking off (gr8's enable_thinking false only
+    // withholds the reasoning, which still takes its tokens), so only thinking_budget bounds it: gr8
+    // closes the think block in place of the budget's Nth token. Thinking disabled (thinking.type
+    // disabled, or no thinking field: Claude Code's background requests) is low effort with a budget,
+    // and the reasoning stays out of the reply (`show_thinking`). A small request (that, a small
+    // max_tokens, or stop sequences) gets a budget of at most --glm-small-budget tokens and
+    // --glm-small-budget-share of its max_tokens, so that its answer fits in the rest.
     let small = !thinking_on || max_tokens <= cfg.small_max_tokens || !stops.is_empty();
-    let mut upstream_max = max_tokens;
     let budget = if forced {
         None // a forced call carries no reasoning (and gr8 refuses a budget beside it)
     } else if small {
-        upstream_max += cfg.small_budget;
-        Some(cfg.small_budget)
+        Some(cfg.small_budget.min((max_tokens as f64 * cfg.small_budget_share) as u64).max(1))
     } else {
         // thinking.type enabled with budget_tokens: kept when it leaves room for an answer
         thinking.and_then(|t| t.get("budget_tokens")).and_then(Value::as_u64).filter(|&b| b >= 1 && b + cfg.min_room <= max_tokens)
     };
     chat.insert("model".into(), json!(cfg.upstream_model));
-    chat.insert("max_tokens".into(), json!(upstream_max));
+    chat.insert("max_tokens".into(), json!(max_tokens));
+    let level = if thinking_on { effort(r.get("output_config").and_then(|o| o.get("effort")), &cfg.default_effort) } else { "low".into() };
     chat.insert("reasoning_effort".into(), json!(level));
+    chat.insert("chat_template_kwargs".into(), json!({"clear_thinking": false}));
     if let Some(b) = budget {
         chat.insert("thinking_budget".into(), json!(b));
     }
-    chat.insert("chat_template_kwargs".into(), json!({"clear_thinking": false}));
     chat.insert("stream".into(), json!(true));
     chat.insert("stream_options".into(), json!({"include_usage": true, "continuous_usage_stats": true}));
     if steered {
@@ -614,6 +642,9 @@ async fn drive(app: Arc<App>, plan: Plan, tx: mpsc::Sender<Msg>) {
         let mut up = match r {
             Ok(u) => u,
             Err(e) => {
+                if let Some(sw) = app.switcher() {
+                    sw.lost(Family::Glm, &e);
+                }
                 let _ = tx.send(Msg::Fail(Fail::new(503, format!("the GLM engine (gr8 at {}) does not answer: {e}", cfg.url)))).await;
                 return;
             }
@@ -850,7 +881,12 @@ pub async fn chat(app: Arc<App>, mut req: Value, steered: bool) -> Response {
     };
     let mut up = match send(&cfg.url, "POST", "/v1/chat/completions", req.to_string()).await {
         Ok(u) => u,
-        Err(e) => return oai(StatusCode::SERVICE_UNAVAILABLE, format!("the GLM engine (gr8 at {}) does not answer: {e}", cfg.url)),
+        Err(e) => {
+            if let Some(sw) = app.switcher() {
+                sw.lost(Family::Glm, &e);
+            }
+            return oai(StatusCode::SERVICE_UNAVAILABLE, format!("the GLM engine (gr8 at {}) does not answer: {e}", cfg.url));
+        }
     };
     let status = StatusCode::from_u16(up.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = up.headers.get(header::CONTENT_TYPE).cloned();
@@ -895,6 +931,7 @@ mod tests {
             default_effort: "high".into(),
             small_max_tokens: 4096,
             small_budget: 1024,
+            small_budget_share: 0.5,
             head_wait: Duration::from_secs(3),
             min_room: 1024,
         }
@@ -902,8 +939,8 @@ mod tests {
 
     #[test]
     fn efforts_are_mapped_and_unknown_ones_are_not_max() {
-        let got: Vec<String> = ["low", "medium", "high", "xhigh", "max", "ultra"].iter().map(|e| effort(Some(&json!(e)), "high")).collect();
-        assert_eq!(got, ["low", "high", "high", "max", "max", "high"]);
+        let got: Vec<String> = ["low", "medium", "high", "xhigh", "max", "none", "ultra"].iter().map(|e| effort(Some(&json!(e)), "high")).collect();
+        assert_eq!(got, ["low", "high", "high", "max", "max", "high", "high"]);
         assert_eq!(effort(None, "high"), "high");
         assert_eq!(effort(Some(&json!(7)), "low"), "low");
     }
@@ -975,17 +1012,27 @@ mod tests {
         let req = json!({"model": "glm-5.3", "max_tokens": 64, "stop_sequences": ["\n", ""],
             "messages": [{"role": "user", "content": "name this chat"}]});
         let p = to_gr8(&req, &cfg(), false).unwrap();
+        assert_eq!(p.body["chat_template_kwargs"], json!({"clear_thinking": false}), "no enable_thinking: it bounds nothing");
         assert_eq!(p.body["reasoning_effort"], "low");
-        assert_eq!(p.body["thinking_budget"], 1024);
-        assert_eq!(p.body["max_tokens"], 64 + 1024);
+        assert_eq!(p.body["thinking_budget"], 32, "half the max_tokens");
+        assert_eq!(p.body["max_tokens"], 64, "not inflated");
         assert!(p.body.get("stop").is_none(), "gr8 would match them in the reasoning");
         assert_eq!(p.stops, ["\n"]);
         assert!(!p.show_thinking);
+        // thinking disabled, a large max_tokens: low effort, the small budget, the reasoning not shown
+        let req = json!({"model": "glm-5.3", "max_tokens": 21333, "thinking": {"type": "disabled"}, "messages": [{"role": "user", "content": "x"}]});
+        let p = to_gr8(&req, &cfg(), false).unwrap();
+        assert_eq!((p.body["reasoning_effort"].as_str(), p.body["thinking_budget"].as_u64(), p.show_thinking), (Some("low"), Some(1024), false));
+        // the share is configurable
+        let c = GlmConfig { small_budget_share: 0.25, ..cfg() };
+        let req = json!({"model": "glm-5.3", "max_tokens": 2112, "messages": [{"role": "user", "content": "x"}]});
+        assert_eq!(to_gr8(&req, &c, false).unwrap().body["thinking_budget"], 528);
         // thinking on but small: the budget too, the reasoning shown
         let req = json!({"model": "glm-5.3", "max_tokens": 200, "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"},
             "messages": [{"role": "user", "content": "hi"}]});
         let p = to_gr8(&req, &cfg(), false).unwrap();
-        assert_eq!((p.body["reasoning_effort"].as_str(), p.body["thinking_budget"].as_u64(), p.show_thinking), (Some("max"), Some(1024), true));
+        assert_eq!((p.body["reasoning_effort"].as_str(), p.body["thinking_budget"].as_u64(), p.show_thinking), (Some("max"), Some(100), true));
+        assert!(p.body["chat_template_kwargs"].get("enable_thinking").is_none());
         // enabled with a budget that leaves room: kept
         let req = json!({"model": "glm-5.3", "max_tokens": 32000, "thinking": {"type": "enabled", "budget_tokens": 8000},
             "messages": [{"role": "user", "content": "hi"}]});
@@ -1085,7 +1132,7 @@ mod tests {
         let mut t = Translator::new(&plan(false, &["\n"]), Box::new(|| "x".into()));
         let mut ev = Vec::new();
         assert!(matches!(t.feed(&chunk(json!({"reasoning": "line one\nline two\n"}), None), &mut ev), Ok(Step::More)));
-        assert!(ev.is_empty(), "thinking off: no thinking block");
+        assert!(ev.is_empty(), "thinking not asked for: no thinking block");
         assert!(matches!(t.feed(&chunk(json!({"content": "Fix the "}), None), &mut ev), Ok(Step::More)));
         assert!(matches!(t.feed(&chunk(json!({"content": "parser\nmore"}), None), &mut ev), Ok(Step::Stopped)));
         assert_eq!(t.finish(&mut ev), "stop_sequence");

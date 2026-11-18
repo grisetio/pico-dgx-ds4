@@ -7,6 +7,7 @@ pub mod gate;
 pub mod glm;
 pub mod guard;
 pub mod mock;
+pub mod mockgr8;
 pub mod protocol;
 pub mod pyjson;
 pub mod server;
