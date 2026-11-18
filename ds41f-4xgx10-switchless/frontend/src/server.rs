@@ -119,7 +119,7 @@ pub struct App {
 }
 
 /// The highest number of the `NNNNNN.json` and `NNNNNN.out.json` files in dir (0: none).
-fn dump_base(dir: &std::path::Path) -> u64 {
+pub(crate) fn dump_base(dir: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
     rd.filter_map(|e| {
         let name = e.ok()?.file_name().into_string().ok()?;
@@ -1269,6 +1269,7 @@ mod tests {
             small_budget_share: 0.5,
             head_wait: Duration::from_secs(3),
             min_room: 1024,
+            dump_dir: None,
         };
         let c = ServerConfig {
             model_name: "deepseek-v4.1-flash".into(),

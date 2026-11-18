@@ -54,6 +54,8 @@ fn usage() -> ! {
       --glm-small-budget-share F  and at most this share of its max_tokens (0.5), so that the answer
                                 fits in the rest
       --glm-min-room N          the least room for an answer; less is \"prompt is too long\": 1024
+      --glm-dump-dir DIR        record each GLM /v1/messages request to DIR, as --dump-dir does DeepSeek's
+                                (the clock sweep's replay reads both); numbers go on after DIR's highest
       --glm-head-wait-ms N      a stream waits this long for gr8's first answer before it starts
                                 with pings (an answer in time can still be an HTTP error): 3000
     engine switching (docs/glm.md), on with --switch-cmd; the boxes hold one engine at a time:
@@ -178,6 +180,7 @@ fn serve(args: &[String]) {
             small_budget_share: parse_opt(args, "--glm-small-budget-share", 0.5f64).clamp(0.0, 0.95),
             head_wait: std::time::Duration::from_millis(parse_opt(args, "--glm-head-wait-ms", 3000u64)),
             min_room: parse_opt(args, "--glm-min-room", 1024u64).max(1),
+            dump_dir: opt(args, "--glm-dump-dir").map(Into::into),
         }),
         active_alias: None,
         active_alias_uncensored: None,

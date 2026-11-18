@@ -52,6 +52,8 @@ pub struct GlmConfig {
     pub head_wait: Duration,
     /// the least room for the answer: a prompt that leaves less is "too long"
     pub min_room: u64,
+    /// --glm-dump-dir: each /v1/messages request recorded here (`dump_request`), for the clock sweep's replay
+    pub dump_dir: Option<std::path::PathBuf>,
 }
 
 impl GlmConfig {
@@ -269,6 +271,8 @@ pub struct Plan {
     pub steered: bool,
     /// the client's max_tokens (the request to gr8 may carry more: the small requests' budget)
     pub max_tokens: u64,
+    /// its dump's number, with --glm-dump-dir
+    pub dump: Option<u64>,
 }
 
 pub fn to_gr8(req: &Value, cfg: &GlmConfig, steered: bool) -> Result<Plan, String> {
@@ -347,6 +351,7 @@ pub fn to_gr8(req: &Value, cfg: &GlmConfig, steered: bool) -> Result<Plan, Strin
         stream: crate::pyjson::truthy(r.get("stream")),
         steered,
         max_tokens,
+        dump: None,
     })
 }
 
@@ -387,6 +392,34 @@ pub async fn count_tokens(app: &App, req: &Value, steered: bool) -> Option<u64> 
         eprintln!("glm: gr8's /tokenize did not answer; count_tokens estimates with DeepSeek's tokenizer");
     }
     n
+}
+
+/// With --glm-dump-dir, a request's record, as DeepSeek's are (server.rs `dump`) so that the clock sweep's
+/// replay reads both: N.json {"request": {"anthropic": …, "gr8": …}, "family": "glm", …}, and at its end
+/// N.out.json (`dump_output`) with `kept`, the completion's tokens (reasoning included). N goes on after the
+/// highest number the directory holds. Some(N) when it was written.
+pub fn dump_request(cfg: &GlmConfig, req: &Value, plan: &Plan) -> Option<u64> {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let dir = cfg.dump_dir.as_ref()?;
+    let n = *BASE.get_or_init(|| crate::server::dump_base(dir)) + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rec = json!({"request": {"anthropic": req, "gr8": plan.body}, "family": "glm", "model": plan.model, "steered": plan.steered, "req_id": n});
+    match std::fs::write(dir.join(format!("{n:06}.json")), rec.to_string()) {
+        Ok(()) => Some(n),
+        Err(e) => {
+            eprintln!("glm dump: {e}");
+            None
+        }
+    }
+}
+
+fn dump_output(cfg: &GlmConfig, n: u64, reason: &str, u: &GrUsage, total_s: f64) {
+    let Some(dir) = &cfg.dump_dir else { return };
+    let rec = json!({"req_id": n, "kept": u.completion, "finish": reason,
+        "usage": {"prompt": u.prompt, "cached": u.cached, "completion": u.completion, "reasoning": u.reasoning}, "total_s": total_s});
+    if let Err(e) = std::fs::write(dir.join(format!("{n:06}.out.json")), rec.to_string()) {
+        eprintln!("glm dump: {e}");
+    }
 }
 
 // ------------------------------------------------------------------ gr8's errors
@@ -785,6 +818,9 @@ async fn drive(app: Arc<App>, plan: Plan, tx: mpsc::Sender<Msg>) {
         u.reasoning,
         t0.elapsed().as_secs_f64()
     );
+    if let (Some(n), Some(cfg)) = (plan.dump, app.cfg.glm.as_ref()) {
+        dump_output(cfg, n, reason, &u, t0.elapsed().as_secs_f64());
+    }
     let content = std::mem::take(&mut tr.blocks.content);
     let _ = tx.send(Msg::Done(reason, tr.stop_sequence.clone(), u, content)).await;
 }
@@ -792,10 +828,11 @@ async fn drive(app: Arc<App>, plan: Plan, tx: mpsc::Sender<Msg>) {
 /// POST /v1/messages for a GLM model name.
 pub async fn messages(app: Arc<App>, req: Value, steered: bool) -> Response {
     let cfg = app.cfg.glm.clone().expect("glm configured");
-    let plan = match to_gr8(&req, &cfg, steered) {
+    let mut plan = match to_gr8(&req, &cfg, steered) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
+    plan.dump = dump_request(&cfg, &req, &plan);
     let (model, stream) = (plan.model.clone(), plan.stream);
     let (tx, mut rx) = mpsc::channel::<Msg>(256);
     tokio::spawn(drive(app.clone(), plan, tx));
@@ -960,6 +997,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn glm_dumps_read_like_deepseeks() {
+        let dir = std::env::temp_dir().join(format!("dsfront-glm-dumps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("000007.json"), "{}").unwrap();
+        let c = GlmConfig { dump_dir: Some(dir.clone()), ..cfg() };
+        let req = json!({"model": "glm-5.3", "max_tokens": 100, "metadata": {"user_id": "session_abc"}, "messages": [{"role": "user", "content": "hi"}]});
+        let p = to_gr8(&req, &c, false).unwrap();
+        let n = dump_request(&c, &req, &p).unwrap();
+        assert_eq!(n, 8, "numbers go on after the highest the directory holds");
+        let rec: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("000008.json")).unwrap()).unwrap();
+        // the clock sweep's replay reads request.anthropic, and `kept` from N.out.json
+        assert_eq!(rec["request"]["anthropic"], req);
+        assert_eq!(rec["request"]["gr8"]["model"], json!("glm-5.3"));
+        dump_output(&c, n, "end_turn", &GrUsage { prompt: 10, completion: 5, cached: 0, reasoning: 3 }, 1.5);
+        let out: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("000008.out.json")).unwrap()).unwrap();
+        assert_eq!(out["kept"], json!(5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn tokenize_body_keeps_the_prompt() {
         let cfg = cfg();
         let req = json!({"model": "glm-5.3-jspark", "max_tokens": 100, "stream": true, "stop_sequences": ["x"],
@@ -989,6 +1046,7 @@ mod tests {
             small_budget_share: 0.5,
             head_wait: Duration::from_secs(3),
             min_room: 1024,
+            dump_dir: None,
         }
     }
 
@@ -1151,7 +1209,7 @@ mod tests {
     }
 
     fn plan(show: bool, stops: &[&str]) -> Plan {
-        Plan { body: json!({}), model: "glm-5.3".into(), show_thinking: show, omit_thinking: true, stops: stops.iter().map(|s| s.to_string()).collect(), stream: true, steered: false, max_tokens: 100 }
+        Plan { body: json!({}), model: "glm-5.3".into(), dump: None, show_thinking: show, omit_thinking: true, stops: stops.iter().map(|s| s.to_string()).collect(), stream: true, steered: false, max_tokens: 100 }
     }
 
     #[test]
