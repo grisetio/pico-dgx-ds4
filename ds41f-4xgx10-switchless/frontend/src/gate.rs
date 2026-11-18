@@ -36,11 +36,24 @@ struct State {
 pub struct Gate {
     st: Mutex<State>,
     hold: Duration,
+    /// with engine switching: why the ring may not be lent now (another engine holds the boxes)
+    busy: Mutex<Option<BusyCheck>>,
 }
+
+pub type BusyCheck = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// A request in flight: dropping it counts the request done.
 pub struct Pass {
     gate: Arc<Gate>,
+    /// with engine switching, its admission to the DeepSeek engine (switch.rs)
+    _ticket: Option<crate::switch::Ticket>,
+}
+
+impl Pass {
+    pub fn with_ticket(mut self, t: Option<crate::switch::Ticket>) -> Pass {
+        self._ticket = t;
+        self
+    }
 }
 
 impl Drop for Pass {
@@ -82,7 +95,13 @@ impl Gate {
         Arc::new(Gate {
             st: Mutex::new(State { held: None, closing: false, in_flight: 0, waiting: 0, last: Instant::now(), passed: 0, refused: 0 }),
             hold,
+            busy: Mutex::new(None),
         })
+    }
+
+    /// `hold` is refused while `check` names a reason (engine switching: the GLM engine is active).
+    pub fn set_busy_check(&self, check: BusyCheck) {
+        *self.busy.lock().unwrap() = Some(check);
     }
 
     pub fn hold_limit(&self) -> Duration {
@@ -111,7 +130,7 @@ impl Gate {
                         s.waiting -= 1;
                         s.passed += 1;
                     }
-                    return Ok(Pass { gate: self.clone() });
+                    return Ok(Pass { gate: self.clone(), _ticket: None });
                 }
                 if t0.elapsed() >= self.hold {
                     s.refused += 1;
@@ -139,6 +158,17 @@ impl Gate {
             return Err(format!("busy: in_flight {} waiting {} idle_s {}", s.in_flight, s.waiting, s.last.elapsed().as_secs()));
         }
         s.held = Some(Instant::now());
+        // with engine switching, held first and checked after: a switch that starts from now on sees
+        // the hold (switch.rs `blocked`), and one that started before is seen here
+        let busy = self.busy.lock().unwrap().clone();
+        if let Some(busy) = busy {
+            drop(s);
+            if let Some(why) = busy() {
+                self.st.lock().unwrap().held = None;
+                return Err(format!("busy: {why}"));
+            }
+            s = self.st.lock().unwrap();
+        }
         eprintln!("gate: holding requests (the ring is lent; no request for {} s)", s.last.elapsed().as_secs());
         Ok(())
     }

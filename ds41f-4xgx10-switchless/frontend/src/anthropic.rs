@@ -20,7 +20,8 @@
 use crate::encoding::Delta;
 use crate::gate::Pass;
 use crate::pyjson::{dumps, truthy};
-use crate::server::{dump, key_ok, prepare, refused, start, ApiError, App, Finish, Gen, Prepared, Usage, KEEP_ALIVE};
+use crate::server::{ds_admit, ds_try, dump, key_ok, prepare, refused, start, ApiError, App, Finish, Gen, Prepared, Usage, KEEP_ALIVE};
+use crate::switch::Ticket;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -39,7 +40,7 @@ const BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
 // ------------------------------------------------------------------ errors
 
-fn error_kind(status: StatusCode) -> &'static str {
+pub(crate) fn error_kind(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 413 | 422 => "invalid_request_error",
         401 => "authentication_error",
@@ -51,11 +52,11 @@ fn error_kind(status: StatusCode) -> &'static str {
     }
 }
 
-fn error_json(kind: &str, msg: &str) -> Value {
+pub(crate) fn error_json(kind: &str, msg: &str) -> Value {
     json!({"type": "error", "error": {"type": kind, "message": msg}})
 }
 
-fn error(status: StatusCode, msg: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     // 503 (the engine down) is Anthropic's 529, which its clients retry with backoff
     let status = if status == StatusCode::SERVICE_UNAVAILABLE { StatusCode::from_u16(529).unwrap() } else { status };
     let body = error_json(error_kind(status), &msg.into()).to_string();
@@ -367,6 +368,12 @@ pub fn to_chat(req: &Value, vision: bool) -> Result<Converted, String> {
 
 /// As `to_chat`; for counting, a conversation may end with the assistant's turn, as the API allows.
 fn convert(req: &Value, vision: bool, counting: bool) -> Result<Converted, String> {
+    convert_for(req, vision, counting, false)
+}
+
+/// `convert`, for a backend that enforces tool_choice and output_config.format itself (glm.rs): no
+/// log line that says they are not.
+pub(crate) fn convert_for(req: &Value, vision: bool, counting: bool, enforced: bool) -> Result<Converted, String> {
     let r = req.as_object().ok_or("the request body must be a JSON object")?;
     let msgs = r.get("messages").and_then(Value::as_array).ok_or("messages must be a list")?;
 
@@ -425,10 +432,10 @@ fn convert(req: &Value, vision: bool, counting: bool) -> Result<Converted, Strin
         Some("none") => {
             chat.insert("tool_choice".into(), json!("none"));
         }
-        Some(t @ ("any" | "tool")) if !counting => eprintln!("anthropic: tool_choice {t:?} is not enforced"),
+        Some(t @ ("any" | "tool")) if !counting && !enforced => eprintln!("anthropic: tool_choice {t:?} is not enforced"),
         _ => {}
     }
-    if !counting && r.get("output_config").and_then(|o| o.get("format")).is_some_and(|f| !f.is_null()) {
+    if !counting && !enforced && r.get("output_config").and_then(|o| o.get("format")).is_some_and(|f| !f.is_null()) {
         eprintln!("anthropic: output_config.format is not enforced");
     }
     chat.insert("chat_template_kwargs".into(), json!({"thinking": thinking_on}));
@@ -464,7 +471,7 @@ pub struct Blocks {
     pub content: Vec<Value>,
 }
 
-type Ev = (&'static str, Value);
+pub(crate) type Ev = (&'static str, Value);
 
 impl Blocks {
     pub fn new(omit_thinking: bool) -> Self {
@@ -545,7 +552,7 @@ fn stop_reason(f: Finish) -> &'static str {
     }
 }
 
-fn usage_json(u: &Usage) -> Value {
+pub(crate) fn usage_json(u: &Usage) -> Value {
     json!({"input_tokens": u.prompt.saturating_sub(u.cached as usize), "cache_creation_input_tokens": 0,
            "cache_read_input_tokens": u.cached, "output_tokens": u.completion})
 }
@@ -576,18 +583,38 @@ pub async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body:
 }
 
 pub async fn messages(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    // the GLM backend's model names go to gr8 (glm.rs)
+    if let Some(g) = &app.cfg.glm {
+        if key_ok(&app, &headers) {
+            if let Ok(req) = serde_json::from_slice::<Value>(&body) {
+                if let Some(steered) = g.route(req.get("model").and_then(Value::as_str)) {
+                    return crate::glm::messages(app, req, steered).await;
+                }
+            }
+        }
+    }
     let (req, conv, p) = match parse(&app, &headers, &body, false) {
         Ok(x) => x,
         Err(r) => return r,
     };
     let record = json!({"anthropic": req, "chat": conv.chat});
+    // With engine switching, a request that has to wait for the DeepSeek engine (a switch from GLM)
+    // waits as for the gate below.
+    let ticket = match ds_try(&app) {
+        Ok(t) => t,
+        Err(()) if p.stream => return stream(app, p, conv, record, None, None),
+        Err(()) => match ds_admit(&app).await {
+            Ok(t) => t,
+            Err(e) => return error(e.0, e.2),
+        },
+    };
     // While the engine is down a stream starts at once and waits with keep-alives (see server.rs);
     // anything else waits here and is refused with 529.
     if p.stream && !app.gate.open(app.engine.info().is_some()) {
-        return stream(app, p, conv, record, None);
+        return stream(app, p, conv, record, None, ticket);
     }
     let pass = match app.gate.enter(&app.engine).await {
-        Ok(pass) => pass,
+        Ok(pass) => pass.with_ticket(ticket),
         Err(r) => {
             let e = refused(r);
             return error(e.0, e.2);
@@ -603,15 +630,15 @@ pub async fn messages(State(app): State<Arc<App>>, headers: HeaderMap, body: Byt
     };
     dump(&app, &record, &p, &gen);
     if p.stream {
-        return stream(app, p, conv, record, Some(gen));
+        return stream(app, p, conv, record, Some(gen), None);
     }
     answer(app, conv, gen).await
 }
 
 /// How long a stream may go without an event before it gets a ping.
-const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn message_id(app: &App) -> String {
+pub(crate) fn message_id(app: &App) -> String {
     format!("msg_{}", app.random_hex(24))
 }
 
@@ -636,12 +663,14 @@ async fn answer(app: Arc<App>, conv: Converted, mut gen: Gen) -> Response {
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
-fn sse(kind: &str, data: &Value) -> Event {
+pub(crate) fn sse(kind: &str, data: &Value) -> Event {
     Event::default().event(kind).data(data.to_string())
 }
 
 /// A streamed answer. Without a started request it waits at the gate first, as the chat path does.
-fn stream(app: Arc<App>, p: Prepared, conv: Converted, record: Value, gen: Option<Gen>) -> Response {
+/// With engine switching it may wait for the DeepSeek engine's turn before that (unless `ticket`):
+/// the message starts at once then, and pings keep it alive through the switch.
+fn stream(app: Arc<App>, p: Prepared, conv: Converted, record: Value, gen: Option<Gen>, ticket: Option<Ticket>) -> Response {
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(async move {
         let fail = |status: StatusCode, msg: String| {
@@ -650,16 +679,52 @@ fn stream(app: Arc<App>, p: Prepared, conv: Converted, record: Value, gen: Optio
                 let _ = tx.send(sse("error", &error_json(error_kind(status), &msg))).await;
             }
         };
+        let ping = || sse("ping", &json!({"type": "ping"}));
+        let id = message_id(&app);
+        let mut started = false;
         let mut gen = match gen {
             Some(g) => g,
             None => {
-                let note = format!("waiting for the engine, up to {} s", app.gate.hold_limit().as_secs());
-                if tx.send(Event::default().comment(note)).await.is_err() {
-                    return;
+                let ticket = match (ticket, app.switcher()) {
+                    (Some(t), _) => Some(t),
+                    (None, None) => None,
+                    (None, Some(sw)) => {
+                        eprintln!("anthropic: waiting for the DeepSeek engine ({})", sw.status());
+                        let start_msg = json!({"type": "message_start", "message": {"id": id, "type": "message",
+                            "role": "assistant", "model": conv.model, "content": [], "stop_reason": null, "stop_sequence": null,
+                            "usage": usage_json(&Usage { prompt: 0, cached: 0, completion: 0, reasoning: 0 })}});
+                        if tx.send(sse("message_start", &start_msg)).await.is_err() || tx.send(ping()).await.is_err() {
+                            return;
+                        }
+                        started = true;
+                        let admit = ds_admit(&app);
+                        tokio::pin!(admit);
+                        let mut quiet = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+                        loop {
+                            tokio::select! {
+                                r = &mut admit => match r {
+                                    Ok(t) => break t,
+                                    Err(e) => return fail(e.0, e.2).await,
+                                },
+                                _ = quiet.tick() => {
+                                    if tx.send(ping()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ = tx.closed() => return,
+                            }
+                        }
+                    }
+                };
+                if !(started && app.gate.open(app.engine.info().is_some())) {
+                    let note = format!("waiting for the engine, up to {} s", app.gate.hold_limit().as_secs());
+                    if tx.send(Event::default().comment(note)).await.is_err() {
+                        return;
+                    }
                 }
                 let pass: Pass = tokio::select! {
                     r = app.gate.enter(&app.engine) => match r {
-                        Ok(pass) => pass,
+                        Ok(pass) => pass.with_ticket(ticket),
                         Err(r) => { let e = refused(r); return fail(e.0, e.2).await; }
                     },
                     _ = tx.closed() => return,
@@ -676,14 +741,15 @@ fn stream(app: Arc<App>, p: Prepared, conv: Converted, record: Value, gen: Optio
                 }
             }
         };
-        let start_msg = json!({"type": "message_start", "message": {"id": message_id(&app), "type": "message",
-            "role": "assistant", "model": conv.model, "content": [], "stop_reason": null, "stop_sequence": null,
-            "usage": usage_json(&Usage { prompt: gen.prompt_ids.len(), cached: gen.reused as u32, completion: 0, reasoning: 0 })}});
-        if tx.send(sse("message_start", &start_msg)).await.is_err() {
-            return;
+        if !started {
+            let start_msg = json!({"type": "message_start", "message": {"id": id, "type": "message",
+                "role": "assistant", "model": conv.model, "content": [], "stop_reason": null, "stop_sequence": null,
+                "usage": usage_json(&Usage { prompt: gen.prompt_ids.len(), cached: gen.reused as u32, completion: 0, reasoning: 0 })}});
+            if tx.send(sse("message_start", &start_msg)).await.is_err() {
+                return;
+            }
+            let _ = tx.send(ping()).await;
         }
-        let ping = || sse("ping", &json!({"type": "ping"}));
-        let _ = tx.send(ping()).await;
         let mut blocks = Blocks::new(conv.omit_thinking);
         let (mut out, mut ev) = (Vec::new(), Vec::new());
         // Hidden thinking and long prefills send nothing for minutes: a ping event (not a comment) keeps

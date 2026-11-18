@@ -12,6 +12,7 @@ use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
 use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
 use crate::session::SessionTable;
+use crate::switch::{Family, Switcher, Ticket};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -52,6 +53,8 @@ pub struct ServerConfig {
     pub vision_addr: Option<String>,
     /// The model name whose requests run on the engine's weight variant (docs/variants.md); None: one model
     pub variant_model: Option<String>,
+    /// The GLM-5.3 backend (gr8, docs/glm.md): its model names go there; None: DeepSeek only
+    pub glm: Option<crate::glm::GlmConfig>,
 }
 
 impl ServerConfig {
@@ -79,6 +82,8 @@ pub struct App {
     /// The dump files' numbers go on after the highest a dump directory already holds (dump_base):
     /// the request ids start at 1 with every start.
     dump_base: u64,
+    /// engine switching (--switch-cmd, switch.rs); unset: the DeepSeek engine only, as before
+    switcher: std::sync::OnceLock<Arc<Switcher>>,
 }
 
 /// The highest number of the `NNNNNN.json` and `NNNNNN.out.json` files in dir (0: none).
@@ -98,7 +103,16 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let dump_base = cfg.dump_dir.as_deref().map_or(0, dump_base);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0), dump_base })
+        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0), dump_base, switcher: Default::default() })
+    }
+
+    /// Engine switching from now on (set once, before serving).
+    pub fn set_switcher(&self, sw: Arc<Switcher>) {
+        let _ = self.switcher.set(sw);
+    }
+
+    pub fn switcher(&self) -> Option<&Arc<Switcher>> {
+        self.switcher.get()
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -178,6 +192,23 @@ pub(crate) fn refused(r: Refused) -> ApiError {
     ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg)
 }
 
+/// With engine switching, a DeepSeek request's admission to its engine if it needs no wait: Ok(None)
+/// without switching, Ok(Some) admitted, Err(()) it has to wait (`ds_admit`).
+pub(crate) fn ds_try(app: &App) -> Result<Option<Ticket>, ()> {
+    match app.switcher() {
+        None => Ok(None),
+        Some(sw) => sw.try_admit(Family::DeepSeek).map(Some).ok_or(()),
+    }
+}
+
+/// Wait for the DeepSeek engine (a switch from GLM): refused as the gate refuses, 503.
+pub(crate) async fn ds_admit(app: &App) -> Result<Option<Ticket>, ApiError> {
+    match app.switcher() {
+        None => Ok(None),
+        Some(sw) => sw.admit(Family::DeepSeek).await.map(Some).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e)),
+    }
+}
+
 /// A stream that waits for the engine carries an SSE comment this often, so that a client's idle
 /// timeout sees bytes (and so does a long prefill's wait for its first token).
 pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(5);
@@ -209,6 +240,14 @@ fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Response> {
 }
 
 async fn health(State(app): State<Arc<App>>) -> Response {
+    if let Some(sw) = app.switcher() {
+        let line = sw.status();
+        match (sw.switching(), sw.active()) {
+            (Some(_), _) | (None, None) => return (StatusCode::SERVICE_UNAVAILABLE, format!("{line}\n")).into_response(),
+            (None, Some(Family::Glm)) => return (StatusCode::OK, format!("ok (glm) {line}\n")).into_response(),
+            (None, Some(Family::DeepSeek)) => {}
+        }
+    }
     if app.gate.held() {
         let msg = format!("the ring is lent to a development job: requests wait up to {} s\n", app.gate.hold_limit().as_secs());
         (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
@@ -225,7 +264,9 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
     let max_len = app.engine.info().map(|i| i.max_context);
     // OpenAI's list, with the fields an Anthropic client reads beside them
-    let names: Vec<&str> = std::iter::once(app.cfg.model_name.as_str()).chain(app.cfg.variant_model.as_deref()).collect();
+    let glm = app.cfg.glm.as_ref().map(|g| [g.model.as_str(), g.steered_model.as_str()]);
+    let names: Vec<&str> =
+        std::iter::once(app.cfg.model_name.as_str()).chain(app.cfg.variant_model.as_deref()).chain(glm.into_iter().flatten()).collect();
     let data: Vec<Value> = names
         .iter()
         .map(|n| {
@@ -870,19 +911,36 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
     };
+    if let Some(steered) = app.cfg.glm.as_ref().and_then(|g| g.route(req.get("model").and_then(Value::as_str))) {
+        return crate::glm::chat(app, req, steered).await;
+    }
     let p = match prepare(&app.cfg, &req) {
         Ok(p) => p,
         Err(e) => return bad_request(e),
+    };
+    // With engine switching, a request that has to wait for the DeepSeek engine (a switch from GLM)
+    // waits as for the gate below.
+    let ticket = match ds_try(&app) {
+        Ok(t) => t,
+        Err(()) if p.stream => return stream(app, p, req, None, None),
+        Err(()) => match ds_admit(&app).await {
+            Ok(t) => t,
+            Err(e) => {
+                let mut resp = e.response();
+                resp.headers_mut().insert("retry-after", RETRY_AFTER_S.into());
+                return resp;
+            }
+        },
     };
     // While the engine is down (the ring lent to a job, or a restart) a request waits at the gate. A
     // stream that has to wait starts at once and carries comments meanwhile, so that its client's
     // timeout sees bytes; refused, it ends with an error event. Anything else waits here, refused with
     // 503 and Retry-After.
     if p.stream && !app.gate.open(app.engine.info().is_some()) {
-        return stream(app, p, req, None);
+        return stream(app, p, req, None, ticket);
     }
     let pass = match app.gate.enter(&app.engine).await {
-        Ok(pass) => pass,
+        Ok(pass) => pass.with_ticket(ticket),
         Err(r) => {
             let mut resp = refused(r).response();
             resp.headers_mut().insert("retry-after", RETRY_AFTER_S.into());
@@ -890,7 +948,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         }
     };
     if p.stream {
-        return stream(app, p, req, Some(pass));
+        return stream(app, p, req, Some(pass), None);
     }
     let mut gen = match start(&app, &p, pass).await {
         Ok(g) => g,
@@ -945,7 +1003,7 @@ pub(crate) fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
 /// A streamed answer. Without a pass it waits at the gate first: the stream starts at once with a
 /// comment saying why, and a refusal (the hold limit, a shutdown) is its error event. Any stream gets
 /// a comment after KEEP_ALIVE without an event (waiting at the gate, or for a long prefill).
-fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Response {
+fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>, ticket: Option<Ticket>) -> Response {
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(async move {
         let last = |e: ApiError| {
@@ -958,14 +1016,33 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         let pass = match pass {
             Some(pass) => pass,
             None => {
+                // with engine switching: the DeepSeek engine's turn first
+                let ticket = match (ticket, app.switcher()) {
+                    (Some(t), _) => Some(t),
+                    (None, None) => None,
+                    (None, Some(sw)) => {
+                        let note = format!("waiting for the DeepSeek engine ({})", sw.status());
+                        if tx.send(Event::default().comment(note)).await.is_err() {
+                            return;
+                        }
+                        tokio::select! {
+                            r = ds_admit(&app) => match r {
+                                Ok(t) => t,
+                                Err(e) => return last(e).await,
+                            },
+                            _ = tx.closed() => return,
+                        }
+                    }
+                };
+                let switched = ticket.is_some() && app.gate.open(app.engine.info().is_some());
                 let why = if app.gate.held() { "the ring is lent to a development job" } else { "the engine is not connected" };
                 let note = format!("waiting for the engine ({why}), up to {} s", app.gate.hold_limit().as_secs());
-                if tx.send(Event::default().comment(note)).await.is_err() {
+                if !switched && tx.send(Event::default().comment(note)).await.is_err() {
                     return;
                 }
                 tokio::select! {
                     r = app.gate.enter(&app.engine) => match r {
-                        Ok(pass) => pass,
+                        Ok(pass) => pass.with_ticket(ticket),
                         Err(r) => return last(refused(r)).await,
                     },
                     _ = tx.closed() => return, // the client went away: counted out at the gate
@@ -1047,6 +1124,7 @@ mod tests {
             hold: Duration::from_secs(600),
             vision_addr: None,
             variant_model: None,
+            glm: None,
         }
     }
 

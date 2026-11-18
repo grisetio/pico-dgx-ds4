@@ -35,6 +35,26 @@ fn usage() -> ! {
       --table-days N            sessions unused for longer are not kept: 7
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
+    the GLM-5.3 backend (docs/glm.md), on with --glm-url:
+      --glm-url URL             gr8's OpenAI API, http://HOST:PORT (A2: http://127.0.0.1:8100)
+      --glm-model NAME          glm-5.3: requests naming it go to gr8
+      --glm-steered-model NAME  glm-5.3-jspark: these go to gr8 with the steering profile
+      --glm-steering-profile P  ablit-behavior-v1    --glm-steering-scale S   1.0
+      --glm-upstream-model NAME the name gr8 serves: glm-5.3
+      --glm-effort E            effort when a thinking request names none: low, high or max (high)
+      --glm-small-max-tokens N  a request up to this max_tokens (or thinking off, or with stop
+                                sequences) is small: 4096
+      --glm-small-budget N      a small request's thinking budget, added to its max_tokens: 1024
+      --glm-min-room N          the least room for an answer; less is \"prompt is too long\": 1024
+      --glm-head-wait-ms N      a stream waits this long for gr8's first answer before it starts
+                                with pings (an answer in time can still be an HTTP error): 3000
+    engine switching (docs/glm.md), on with --switch-cmd; the boxes hold one engine at a time:
+      --switch-cmd PATH         run as `PATH deepseek|glm` to switch engines (DSFRONT_SWITCH_FROM set);
+                                dsfront then waits for pico's socket or gr8's /health
+      --switch-min-s N          after a switch its family keeps the engine at least this long: 60
+      --switch-timeout-s N      the command and the readiness wait, together: 1200
+      --switch-retry-s N        after a failed switch, the next try waits this long: 30
+      --switch-home-s N         switch back to DeepSeek after GLM was idle this long (0: never): 0
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -42,6 +62,12 @@ fn usage() -> ! {
       --delay-ms N              per generated token: 5
       --prefill-tps N           simulated prefill tokens/s: 20000
       --max-context N           1048576
+  dsfront mock-gr8 [options]                          a gr8 stand-in: its OpenAI API and stream format
+      --listen ADDR             127.0.0.1:8100
+      --ready-after-s N         /health is 503 for this long after the start: 0
+      --max-context N           202752      --delay-ms N   per token: 2    --prefill-tps N   50000
+      --steering-profile NAME   the profiles it accepts (repeat it); none: it refuses steering
+      --dump-dir DIR            write each request it gets to DIR
   dsfront tokcheck <cases.jsonl>                      compare against reference ids ({{\"text\",\"ids\"}} per line)
   dsfront enccheck <cases.jsonl> [--encoding E]       compare the chat encoding with encoding.py's (tools/gen_encoding_cases.py)
   dsfront tokenize <file>                             print ids of a file's text
@@ -124,7 +150,55 @@ fn serve(args: &[String]) {
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
         variant_model: opt(args, "--variant-model"),
+        glm: opt(args, "--glm-url").map(|url| dsfront::glm::GlmConfig {
+            url,
+            upstream_model: opt(args, "--glm-upstream-model").unwrap_or_else(|| "glm-5.3".into()),
+            model: opt(args, "--glm-model").unwrap_or_else(|| "glm-5.3".into()),
+            steered_model: opt(args, "--glm-steered-model").unwrap_or_else(|| "glm-5.3-jspark".into()),
+            profile: opt(args, "--glm-steering-profile").unwrap_or_else(|| "ablit-behavior-v1".into()),
+            scale: parse_opt(args, "--glm-steering-scale", 1.0f64),
+            default_effort: {
+                let e = opt(args, "--glm-effort").unwrap_or_else(|| "high".into());
+                if !["low", "high", "max"].contains(&e.as_str()) {
+                    eprintln!("bad value for --glm-effort: {e} (low, high or max)");
+                    std::process::exit(2);
+                }
+                e
+            },
+            small_max_tokens: parse_opt(args, "--glm-small-max-tokens", 4096u64),
+            small_budget: parse_opt(args, "--glm-small-budget", 1024u64).max(1),
+            head_wait: std::time::Duration::from_millis(parse_opt(args, "--glm-head-wait-ms", 3000u64)),
+            min_room: parse_opt(args, "--glm-min-room", 1024u64).max(1),
+        }),
     };
+    if let Some(g) = &cfg.glm {
+        let ds = [Some(cfg.model_name.as_str()), cfg.variant_model.as_deref()];
+        if g.model == g.steered_model || ds.contains(&Some(g.model.as_str())) || ds.contains(&Some(g.steered_model.as_str())) {
+            eprintln!("--glm-model and --glm-steered-model must differ from each other and from the DeepSeek names");
+            std::process::exit(2);
+        }
+        dsfront::glm::GlmConfig::check_url(&g.url).unwrap_or_else(|e| {
+            eprintln!("bad value for --glm-url: {e}");
+            std::process::exit(2)
+        });
+    }
+    let switch = opt(args, "--switch-cmd").map(|cmd| {
+        if cfg.glm.is_none() {
+            eprintln!("--switch-cmd needs --glm-url");
+            std::process::exit(2);
+        }
+        let home = parse_opt(args, "--switch-home-s", 0u64);
+        let timeout = std::time::Duration::from_secs(parse_opt(args, "--switch-timeout-s", 1200u64));
+        let sc = dsfront::switch::SwitchConfig {
+            min_dwell: std::time::Duration::from_secs(parse_opt(args, "--switch-min-s", 60u64)),
+            timeout,
+            retry_after: std::time::Duration::from_secs(parse_opt(args, "--switch-retry-s", 30u64)),
+            // a request waits for a switch and then the gate's hold at most
+            max_wait: timeout + cfg.hold,
+            home_after: (home > 0).then(|| std::time::Duration::from_secs(home)),
+        };
+        (std::path::PathBuf::from(cmd), sc)
+    });
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
@@ -133,6 +207,24 @@ fn serve(args: &[String]) {
     runtime().block_on(async move {
         let engine = dsfront::engine::EngineClient::start(socket.into());
         let app = App::new(cfg, tok, engine);
+        if let Some((cmd, sc)) = switch {
+            use dsfront::switch::{CmdDriver, Family, Switcher};
+            let glm_url = app.cfg.glm.as_ref().unwrap().url.clone();
+            // the engine that runs now: gr8 if it answers, else pico's (it may still be starting)
+            let active = if dsfront::glm::health(&glm_url, std::time::Duration::from_secs(3)).await { Family::Glm } else { Family::DeepSeek };
+            eprintln!("engine switching with {}: the {} engine is active", cmd.display(), active.name());
+            let driver = std::sync::Arc::new(CmdDriver { cmd, engine: app.engine.clone(), glm_url, gate: app.gate.clone() });
+            let sw = Switcher::new(sc, driver, Some(active));
+            sw.spawn_home();
+            // no ring lent to a job while another engine holds the boxes or is wanted
+            let s2 = std::sync::Arc::downgrade(&sw);
+            app.gate.set_busy_check(std::sync::Arc::new(move || {
+                s2.upgrade()?.lend_refusal()
+            }));
+            app.set_switcher(sw);
+        } else if let Some(g) = &app.cfg.glm {
+            eprintln!("GLM backend at {} without engine switching: both engines are expected to run", g.url);
+        }
         if let Some(t) = &table {
             eprintln!("{}", app.load_sessions(t, table_age_s));
         }
