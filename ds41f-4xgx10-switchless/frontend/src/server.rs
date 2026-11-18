@@ -74,15 +74,25 @@ impl ServerConfig {
             _ => &self.model_name,
         }
     }
-    /// Some(uncensored) when `model` is an active-engine alias.
+    /// Some(uncensored) when `model` is an active-engine alias. With GLM beside DeepSeek, a name neither
+    /// engine serves counts as the plain alias: Claude Code's own model names (T3 writes a thread's titles
+    /// and commit messages with claude-haiku-*) run on the loaded engine instead of switching to DeepSeek.
     pub fn alias_of(&self, model: &str) -> Option<bool> {
         if Some(model) == self.active_alias.as_deref() {
             Some(false)
         } else if Some(model) == self.active_alias_uncensored.as_deref() {
             Some(true)
+        } else if self.glm.is_some() && !self.serves(model) {
+            Some(false)
         } else {
             None
         }
+    }
+    /// A model name one of the engines serves: DeepSeek's, its variant's, or a GLM name.
+    pub fn serves(&self, model: &str) -> bool {
+        model == self.model_name
+            || Some(model) == self.variant_model.as_deref()
+            || self.glm.as_ref().is_some_and(|g| model == g.model || model == g.steered_model)
     }
     /// The model name of weight variant v.
     pub fn name_of(&self, v: u32) -> &str {
@@ -228,7 +238,8 @@ pub(crate) fn resolve_alias(app: &App, model: &str) -> Option<String> {
 /// only when it holds an alias's name.
 pub(crate) fn alias_body(app: &App, body: &Bytes) -> Option<Bytes> {
     let names = [app.cfg.active_alias.as_deref(), app.cfg.active_alias_uncensored.as_deref()];
-    if !names.into_iter().flatten().any(|n| !n.is_empty() && body.windows(n.len()).any(|w| w == n.as_bytes())) {
+    // with GLM, any name may be an alias (ServerConfig::alias_of): the body is read every time
+    if app.cfg.glm.is_none() && !names.into_iter().flatten().any(|n| !n.is_empty() && body.windows(n.len()).any(|w| w == n.as_bytes())) {
         return None;
     }
     let mut req: Value = serde_json::from_slice(body).ok()?;
@@ -1268,6 +1279,13 @@ mod tests {
             ..cfg()
         };
         assert_eq!((c.alias_of("local-active"), c.alias_of("local-active-uncensored"), c.alias_of("glm-5.3")), (Some(false), Some(true), None));
+        // the served names stay themselves; any other name runs on the loaded engine, as local-active
+        for m in ["deepseek-v4.1-flash", "deepseek-v4.1-flash-heretic", "glm-5.3-jspark"] {
+            assert_eq!(c.alias_of(m), None, "{m}");
+        }
+        assert_eq!(c.alias_of("claude-haiku-4-5"), Some(false));
+        let no_glm = ServerConfig { glm: None, ..c.clone() };
+        assert_eq!(no_glm.alias_of("claude-haiku-4-5"), None, "without GLM an unknown name stays DeepSeek's");
         assert_eq!(c.alias_target(Family::DeepSeek, false), "deepseek-v4.1-flash");
         assert_eq!(c.alias_target(Family::DeepSeek, true), "deepseek-v4.1-flash-heretic");
         assert_eq!(c.alias_target(Family::Glm, false), "glm-5.3");
