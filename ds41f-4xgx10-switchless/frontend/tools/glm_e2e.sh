@@ -32,8 +32,9 @@ trap cleanup EXIT
 echo $! >"$W/dsfront.pid"
 for _ in $(seq 50); do curl -sf "$B/health" >/dev/null && break; sleep 0.2; done
 
-msg() { curl -s -N "$B/v1/messages" -H 'content-type: application/json' -d "$1"; }
-code() { curl -s -o "$W/body" -w '%{http_code}' "$B/v1/messages" -H 'content-type: application/json' -d "$1"; }
+# the body on stdin: Linux caps one argument at 128 KiB (MAX_ARG_STRLEN), and the overflow checks' are larger
+msg() { curl -s -N "$B/v1/messages" -H 'content-type: application/json' --data-binary @- <<<"$1"; }
+code() { curl -s -o "$W/body" -w '%{http_code}' "$B/v1/messages" -H 'content-type: application/json' --data-binary @- <<<"$1"; }
 has() { grep -q -- "$1" <<<"$2"; }
 last_dump() { ls -t "$W"/gr8-dump/*.json | head -1; }
 
