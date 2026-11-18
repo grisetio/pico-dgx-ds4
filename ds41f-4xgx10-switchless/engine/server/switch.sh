@@ -1,54 +1,60 @@
 #!/bin/bash
-# DRAFT, not run on the boxes yet: dsfront's --switch-cmd on A2 (docs/glm.md, "Engine switching"). It
-# moves the four boxes between pico's DeepSeek engine (service.sh's ranks) and gr8's GLM-5.3 (the recipe
-# kindlingai/glm-5.3-exlr8-k4-4x-spark at fb9a0b4: docker compose on every box, the head on A2).
+# dsfront's --switch-cmd on A2 (docs/glm.md, "Engine switching"). It moves the four boxes between pico's
+# DeepSeek engine (service.sh's ranks) and gr8's GLM-5.3 (the recipe kindlingai/glm-5.3-exlr8-k4-4x-spark
+# at fb9a0b4: docker compose on every box, the head on A2).
 #   engine/server/switch.sh deepseek|glm      DSFRONT_SWITCH_FROM: what dsfront takes for active (or none)
 #   engine/server/switch.sh status            which engine runs, and who holds the ring
 # dsfront runs it once the requests in flight are done, then waits by itself until the new engine is
 # ready (pico's socket answers, or gr8's /health is 200), up to --switch-timeout-s. So the script returns
 # once the stop is over and the start is under way: exit 0, or non-zero with the reason on stderr (the
-# switch fails, and its waiting requests get 529). It must be idempotent: dsfront runs it again after a
+# switch fails, and its waiting requests get 529). It is idempotent: dsfront runs it again after a
 # failure, and after gr8 stopped answering while active (to start it again).
 #
 # The ring: gr8 runs as a ring job (ringlock.sh, docs/engine.md "Borrowing the ring"). The switch to GLM
-# starts a holder, `switch.sh _hold`, that waits in the ring's queue like any job; the service lends the
-# ring to it (its engine stops, dsfront holds DeepSeek requests at its gate); the holder runs gr8 while it
-# has the ring. The switch to DeepSeek stops gr8 and ends the holder: the service takes the ring back and
-# starts its engine, and releases dsfront's gate. So development jobs and gr8 never share the boxes, and
-# the service's supervisor stays the one that runs pico's engine.
+# starts a holder, `switch.sh _hold`, that waits in the ring's queue like any job and asks the service to
+# lend it the ring at once (service.sh lend-now: without DSGB10_YIELD_IDLE_S, only for this want, only
+# while it is the only one); the service stops its engine (dsfront holds DeepSeek requests at its gate)
+# and the holder has the ring while gr8 runs. Nothing preempts it (PREEMPT=0's semantics: the service's
+# reclaim does not stop it): only `switch.sh deepseek` ends it, which stops gr8 first. Then the service
+# takes the ring back, starts its engine and releases dsfront's gate. So development jobs and gr8 never
+# share the boxes, and the service's supervisor stays the one that runs pico's engine.
 #
-# PLACEHOLDERS, to settle at the deploy (marked PLACEHOLDER below):
-# - lend_now: service.sh lends the ring only once no request came for DSGB10_YIELD_IDLE_S (600) and its
-#   engine has run that long. A switch needs it at once; service.sh has no command for that yet.
-# - gr8_start / gr8_stop: the recipe's compose commands on each box (paths, env file, the order).
-# - the box names and the recipe's directory.
+# Settings (environment): GLM_BOXES, GLM_DIR, GLM_ENV, GLM_HEALTH, GLM_STOP_S, RING_WAIT_S, SERVICE_RUN.
 set -u
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
-. "$(dirname "$0")/ringlock.sh"  # FLEET, RING_LOCK, ring_take, ring_run
+export FLEET=${FLEET:-$HOME/dsgb10/fleet-sparks.conf}
+. "$(dirname "$0")/ringlock.sh"  # FLEET, RING_LOCK, RING_OWNER, RING_WANTS, ring_take
 
-# PLACEHOLDER: the boxes gr8 runs on, head first (the recipe's rank order), as ssh targets
-GLM_BOXES=${GLM_BOXES:-a2 b2 c2 d2}
-# PLACEHOLDER: the recipe's compose directory, the same path on every box
-GLM_DIR=${GLM_DIR:-/home/kgriset/glm-5.3-exlr8-k4-4x-spark}
+# the boxes gr8 runs on in the recipe's rank order, head first: `local` is this box (A2, rank 0), the
+# others ssh targets as in the fleet file (A4, A3, A1)
+GLM_BOXES=${GLM_BOXES:-local 192.168.1.59 192.168.1.106 192.168.1.81}
+# the recipe's compose directory, the same path on every box
+GLM_DIR=${GLM_DIR:-$HOME/glm-5.3-exlr8-k4-4x-spark}
+# the env file installed as .env before each start (.env.stock: stock; .env.jspark: the same plus the
+# JSPARK release with its steering profile loaded, which serves stock requests too). One with an hf:
+# STEERING_PROFILE starts with HF_TOKEN from ~/.config/gr8/hf-token (mode 600) through compose.hf-token.yaml
+GLM_ENV=${GLM_ENV:-.env.jspark}
 GLM_HEALTH=${GLM_HEALTH:-http://127.0.0.1:8100/health}
-# gr8 stores its sessions' KV at a stop (GR8_STOP_GRACE, 150 s in its SWITCHING.md): a stop takes that long
-GLM_STOP_S=${GLM_STOP_S:-200}
-# dsfront's admin socket (service.sh's run/admin.sock) and binary
+# gr8's stop: `glm53 down` on the head, then compose down everywhere, measured at 6.4 s (2026-11-18);
+# each of the three waits is bounded by this
+GLM_STOP_S=${GLM_STOP_S:-60}
 SERVICE_RUN=${SERVICE_RUN:-$HOME/dsgb10/service/run}
-DSFRONT=${DSFRONT:-$HOME/dsgb10/service/bin/dsfront}
-HOLDER_PID=$SERVICE_RUN/glm-holder.pid
+HOLDER_PID=$SERVICE_RUN/glm-holder.pid HOLDER_STATE=$SERVICE_RUN/glm-holder.state
 HOLDER_LOG=${HOLDER_LOG:-$HOME/dsgb10/service/logs/glm-holder.log}
 # how long the switch to GLM waits for the ring (the service's lend; a development job on it)
 RING_WAIT_S=${RING_WAIT_S:-900}
 
 log() { echo "$(date '+%F %T') switch.sh: $*" >&2; }
 die() { log "$*"; exit 1; }
-admin() { "$DSFRONT" admin --socket "$SERVICE_RUN/admin.sock" "$@" 2> /dev/null; }
 on_boxes() {  # shell text: run it on every gr8 box at once; fails if any fails
   local b pids=() rc=0
   for b in $GLM_BOXES; do
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$b" "$1" &
+    if [ "$b" = local ]; then
+      bash -c "$1" < /dev/null &
+    else
+      ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$b" "$1" &
+    fi
     pids+=($!)
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
@@ -56,66 +62,74 @@ on_boxes() {  # shell text: run it on every gr8 box at once; fails if any fails
 }
 gr8_healthy() { [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$GLM_HEALTH")" = 200 ]; }
 holder() { local p; p=$(cat "$HOLDER_PID" 2> /dev/null) && kill -0 "$p" 2> /dev/null && echo "$p"; }
-holding() { [ -n "$(holder)" ] && [ "$(sed -n 1p "$SERVICE_RUN/glm-holder.state" 2> /dev/null)" = holding ]; }
+holding() { [ -n "$(holder)" ] && [ "$(cat "$HOLDER_STATE" 2> /dev/null)" = holding ]; }
 
 gr8_start() {
-  # PLACEHOLDER: the recipe's start on every box (workers first if its compose needs them up before the head)
-  on_boxes "cd '$GLM_DIR' && docker compose up -d"
+  local up="docker compose up -d"
+  grep -q '^STEERING_PROFILE=hf:' "$GLM_DIR/$GLM_ENV" &&
+    up="HF_TOKEN=\"\$(cat ~/.config/gr8/hf-token)\" docker compose -f compose.yaml -f compose.hf-token.yaml up -d"
+  on_boxes "cd '$GLM_DIR' && cp -p '$GLM_ENV' .env && $up > /dev/null 2>&1"
 }
-gr8_stop() {
-  # PLACEHOLDER: the recipe's orderly stop on every box (it stores the KV store's sessions first)
-  on_boxes "cd '$GLM_DIR' && timeout $GLM_STOP_S docker compose down"
+gr8_left() {  # true while a gr8 container or engine is left on any box
+  ! on_boxes "cd '$GLM_DIR' && [ -z \"\$(docker compose ps -q 2> /dev/null)\" ] && ! pgrep -f 'bin/g6m[4]' > /dev/null"
 }
-gr8_running() {
-  # PLACEHOLDER: any of gr8's containers up on any box
-  on_boxes "cd '$GLM_DIR' && [ -z \"\$(docker compose ps -q)\" ]" > /dev/null 2>&1 && return 1
-  return 0
-}
-lend_now() {
-  # PLACEHOLDER: make service.sh lend the ring at once to the waiting holder. dsfront's hold already
-  # succeeds now (it allows it while a switch to GLM runs); the supervisor's own conditions
-  # (YIELD_IDLE_S without a request, and since its engine's start) do not. Needs, say, a service.sh
-  # command `lend-now` that skips them for a want whose line says "glm-5.3 (switch.sh)".
-  admin hold 0 > /dev/null
-  "$SRC/engine/server/service.sh" lend-now 2> /dev/null || true
+gr8_stop() {  # the head's orderly stop of every rank, then the containers (restart: on-failure would bring a failed rank back)
+  local t0=$SECONDS
+  (cd "$GLM_DIR" && [ -n "$(docker compose ps -q --status running 2> /dev/null)" ] &&
+    timeout "$GLM_STOP_S" docker compose exec -T gr8 /opt/gr8/gr8 glm53 down < /dev/null > /dev/null 2>&1)
+  on_boxes "cd '$GLM_DIR' && timeout $GLM_STOP_S docker compose down > /dev/null 2>&1"
+  while gr8_left; do
+    ((SECONDS - t0 < 2 * GLM_STOP_S)) || return 1
+    sleep 1
+  done
 }
 
-# The holder: waits for the ring, then holds it while gr8 runs; stopped by `switch.sh deepseek` (TERM)
-# or preempted by the service (TERM to its process group, from ring_run): gr8 stops in both cases.
+# The holder: waits for the ring, then holds it until `switch.sh deepseek` (TERM), which it answers by
+# stopping gr8 before the lock goes. Its pid is its want's name (ring.wants/<pid>), which lend-now names.
 cmd_hold() {
-  echo waiting > "$SERVICE_RUN/glm-holder.state"
-  OWNER="glm-5.3 (switch.sh)" LOCK_WAIT=$RING_WAIT_S ring_take "glm-5.3 (switch.sh): gr8 on $GLM_BOXES" || exit 1
+  echo $$ > "$HOLDER_PID"
+  echo waiting > "$HOLDER_STATE"
+  OWNER="glm-5.3 (switch.sh)" LOCK_WAIT=$RING_WAIT_S ring_take "glm-5.3 (switch.sh): gr8 on $GLM_BOXES" || {
+    rm -f "$HOLDER_STATE" "$HOLDER_PID"
+    exit 1
+  }
   echo "$(date '+%F %T') pid $$ glm-5.3 (switch.sh): gr8 on $GLM_BOXES" > "$RING_OWNER"
-  ring_run bash -c '
-    trap "exit 0" TERM
-    echo holding > "'"$SERVICE_RUN"'/glm-holder.state"
-    while :; do sleep 3600 & wait $!; done'
-  rc=$?
-  echo stopping > "$SERVICE_RUN/glm-holder.state"
-  # a preemption (76) or a stop: gr8 must be down before the lock goes (the service starts its engine next)
-  gr8_stop || log "gr8's stop failed on a box: look at it before the service's engine starts"
-  rm -f "$SERVICE_RUN/glm-holder.state" "$HOLDER_PID"
-  exit $rc
+  STOPPING=
+  trap 'STOPPING=1' TERM INT
+  echo holding > "$HOLDER_STATE"
+  log "holding the ring"
+  while [ -z "$STOPPING" ]; do
+    sleep 1 &
+    wait $!
+  done
+  echo stopping > "$HOLDER_STATE"
+  # gr8 must be down before the lock goes (the service starts its engine next)
+  gr8_stop || log "gr8's stop did not finish on every box: look at it before the service's engine starts"
+  log "gr8 is down; releasing the ring"
+  rm -f "$HOLDER_STATE" "$HOLDER_PID"
+  exit 0  # the lock (fd 9) goes with this process
 }
 
 to_glm() {
+  local p t0=$SECONDS
   if holding && gr8_healthy; then
     log "gr8 already runs on the ring"
     return 0
   fi
   if [ -z "$(holder)" ]; then
+    rm -f "$HOLDER_PID" "$HOLDER_STATE"
     setsid nohup "$SELF" _hold >> "$HOLDER_LOG" 2>&1 < /dev/null &
-    echo $! > "$HOLDER_PID"
   fi
-  lend_now
-  local t0=$SECONDS
   until holding; do
-    [ -n "$(holder)" ] || die "the ring holder ended (see $HOLDER_LOG)"
+    p=$(holder)
+    if [ -z "$p" ] && ((SECONDS - t0 > 5)); then die "the ring holder ended (see $HOLDER_LOG)"; fi
+    # the service lends at once to this want (it needs nothing in flight at dsfront: dsfront's switch waits for that)
+    [ -n "$p" ] && [ -e "$RING_WANTS/$p" ] && "$SRC/engine/server/service.sh" lend-now "$p" > /dev/null 2>&1
     ((SECONDS - t0 < RING_WAIT_S)) || die "no ring after $RING_WAIT_S s (owner: $(cat "$RING_OWNER" 2> /dev/null))"
     sleep 1
   done
-  log "the ring is ours after $((SECONDS - t0)) s; starting gr8"
-  gr8_start || die "gr8's start failed"
+  log "the ring is ours after $((SECONDS - t0)) s; starting gr8 ($GLM_ENV)"
+  gr8_start || die "gr8's start failed on a box"
   # readiness (gr8's /health 200) is dsfront's to wait for
 }
 
@@ -123,14 +137,15 @@ to_deepseek() {
   local p t0=$SECONDS
   p=$(holder)
   if [ -n "$p" ]; then
-    kill -TERM "$p"  # its gr8_stop runs, then the lock goes
+    kill -TERM "$p"  # it stops gr8, then the lock goes
     while kill -0 "$p" 2> /dev/null; do
-      ((SECONDS - t0 < GLM_STOP_S + 30)) || die "the ring holder did not end in $((GLM_STOP_S + 30)) s"
-      sleep 1
+      ((SECONDS - t0 < 3 * GLM_STOP_S + 30)) || die "the ring holder did not end in $((3 * GLM_STOP_S + 30)) s"
+      sleep 0.5
     done
-  elif gr8_running; then
+  fi
+  if gr8_left; then
     log "gr8 runs without a holder: stopping it"
-    gr8_stop || die "gr8's stop failed"
+    gr8_stop || die "gr8's stop did not finish on every box"
   fi
   log "gr8 is down after $((SECONDS - t0)) s; the service takes the ring back and starts its engine"
   # the service's supervisor sees the lock free (within 2 s), retakes it, starts the ranks and releases
@@ -142,7 +157,7 @@ case ${1:-} in
   deepseek) to_deepseek ;;
   _hold) cmd_hold ;;
   status)
-    echo "holder: $(holder || echo none) ($(cat "$SERVICE_RUN/glm-holder.state" 2> /dev/null || echo -)); gr8 health: $(gr8_healthy && echo 200 || echo no)"
+    echo "holder: $(holder || echo none) ($(cat "$HOLDER_STATE" 2> /dev/null || echo -)); gr8 health: $(gr8_healthy && echo 200 || echo no); gr8 left on a box: $(gr8_left && echo yes || echo no)"
     echo "ring: $(cat "$RING_OWNER" 2> /dev/null)"
     ;;
   *) echo "usage: switch.sh deepseek|glm|status" >&2; exit 2 ;;

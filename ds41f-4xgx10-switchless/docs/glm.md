@@ -90,14 +90,18 @@ request of its family would pass now; else the family that a waiting request is 
 alias request never starts a switch of its own. dsfront logs `alias: local-active -> glm-5.3 (the glm engine)`;
 the answer names the model it ran on.
 
-## On A2: engine/server/switch.sh (a draft)
+## On A2: engine/server/switch.sh
 
-`switch.sh glm` starts a holder that waits for the ring as a job (ringlock.sh); the service lends the ring to
-it (stops its engine; dsfront holds DeepSeek requests); the holder then runs gr8 with docker compose on the
-four boxes and holds the ring while it runs. `switch.sh deepseek` stops gr8 and ends the holder; the service
-takes the ring back, starts its engine and releases dsfront's gate. Marked PLACEHOLDER in it: the immediate
-lend (service.sh lends only after `DSGB10_YIELD_IDLE_S` without requests), the recipe's compose commands,
-the box names and paths.
+`switch.sh glm` starts a holder that waits for the ring as a job (ringlock.sh) and asks the service to lend
+it at once: `service.sh lend-now PID` skips `DSGB10_YIELD_IDLE_S` for that one want, only while it is the
+only want and dsfront's `hold 0` succeeds, so other ring jobs still wait for the idle time. The service stops
+its engine (dsfront holds DeepSeek requests); the holder then runs gr8 with docker compose on the four boxes
+(`GLM_ENV`, default `.env.jspark`, installed as `.env`) and holds the ring. Nothing preempts it: only
+`switch.sh deepseek` ends it, which runs `glm53 down` on the head, `docker compose down` on every box and
+waits until no `g6m4` is left (`GLM_STOP_S`, 60), before the lock goes. The service then takes the ring back,
+starts its engine and releases dsfront's gate. `switch.sh status` shows the holder, gr8's health and the
+ring's owner. Settings: `GLM_BOXES` (head first; `local` is this box), `GLM_DIR`, `GLM_ENV`, `GLM_STOP_S`,
+`RING_WAIT_S`.
 
 ```bash
 DSGB10_FRONT_ARGS="--glm-url http://127.0.0.1:8100 --switch-cmd $SRC/engine/server/switch.sh" service.sh start

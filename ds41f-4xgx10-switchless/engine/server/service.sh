@@ -12,6 +12,10 @@
 #   engine/server/service.sh restart   # stop, then start (with this environment's settings, as start)
 #   engine/server/service.sh forget    # the kept sessions gone on every box, and dsfront's saved table
 #                                      # (not while it runs: stop --forget stops it first)
+#   engine/server/service.sh lend-now PID  # lend the ring at once to the job PID that waits for it (its want,
+#                                      # ring.wants/PID), without DSGB10_YIELD_IDLE_S: switch.sh's GLM holder.
+#                                      # Only while that want is the only one and dsfront's hold 0 succeeds
+#                                      # (nothing in flight or waiting); asked again within LEND_NOW_S (60)
 # Settings, from the environment of start (written to run/settings, which status and stop read):
 #   DSGB10_ADDR, DSGB10_PORT  the front-end's addresses and port: 127.0.0.1 and 18893, a test port. One
 #                             or more IPv4 addresses, separated by spaces or commas ("127.0.0.1 <private
@@ -305,8 +309,20 @@ wants() {  # [held]: the jobs waiting for the ring, a line each (held: drivers' 
   done
 }
 own() { echo "$(date '+%F %T') pid $$ service: service.sh, front-end $(urls)${NOTE:+ ($NOTE)}" > "$OWNERF"; }
-lend() {  # jobs: dsfront holds requests (its hold succeeded); the engine stops and the ring lock goes
-  log "lending the ring: no request for $YIELD_IDLE_S s; waiting for it: $(paste -sd'|' <<< "$1")"
+lend_now_asked() {  # a fresh `service.sh lend-now PID` whose job's want is the only one waiting
+  local pid t f
+  read -r pid t < "$RUN/lend-now" 2> /dev/null || return 1
+  if ! [[ $pid =~ ^[0-9]+$ && $t =~ ^[0-9]+$ ]] || (($(date +%s) - t > ${LEND_NOW_S:-60})); then
+    rm -f "$RUN/lend-now"
+    return 1
+  fi
+  f=$RING_WANTS/$pid
+  flock -n -s -E 99 "$f" true 2> /dev/null
+  [ $? = 99 ] || return 1  # no want, or its job is gone
+  [ "$(wants | wc -l)" = 1 ]
+}
+lend() {  # jobs [why]: dsfront holds requests (its hold succeeded); the engine stops and the ring lock goes
+  log "lending the ring: ${2:-no request for $YIELD_IDLE_S s}; waiting for it: $(paste -sd'|' <<< "$1")"
   state lending "stopping the engine for a ring job"
   stop_engine
   flock -u 9
@@ -416,7 +432,12 @@ supervise() {
     if [ "$LENT" = 0 ]; then
       jobs=$(wants)
       # not within YIELD_IDLE_S of the engine's last start either: what brought it back was a request
-      if [ -n "$jobs" ] && [ -z "$STOP" ] && { [ -z "$R0" ] || { [ "$READY" = 1 ] && ((now - READY_T >= YIELD_IDLE_S)); }; } &&
+      # lend-now (switch.sh's GLM holder): at once, once the engine is not starting and nothing is in flight
+      if [ -n "$jobs" ] && [ -z "$STOP" ] && { [ -z "$R0" ] || [ "$READY" = 1 ]; } && lend_now_asked &&
+        [ "$(admin hold 0)" = ok ]; then
+        rm -f "$RUN/lend-now"
+        lend "$jobs" "at once (lend-now)"
+      elif [ -n "$jobs" ] && [ -z "$STOP" ] && { [ -z "$R0" ] || { [ "$READY" = 1 ] && ((now - READY_T >= YIELD_IDLE_S)); }; } &&
         [ "$(admin hold "$YIELD_IDLE_S")" = ok ]; then
         lend "$jobs"
       elif [ -n "$jobs" ] && [ "$jobs" != "$seen" ]; then
@@ -690,10 +711,15 @@ case ${1:-} in
     ;;
   forget) cmd_forget ;;
   status) cmd_status ;;
+  lend-now)
+    [[ ${2:-} =~ ^[0-9]+$ ]] || die "usage: service.sh lend-now PID (the job that waits for the ring)"
+    sup_pid > /dev/null || die "not running"
+    echo "$2 $(date +%s)" > "$RUN/lend-now"
+    ;;
   restart)
     settings
     check
     cmd_stop && cmd_start
     ;;
-  *) die "usage: service.sh start|stop [--forget]|status|restart|forget (settings: the header of $SELF)" ;;
+  *) die "usage: service.sh start|stop [--forget]|status|restart|forget|lend-now PID (settings: the header of $SELF)" ;;
 esac
