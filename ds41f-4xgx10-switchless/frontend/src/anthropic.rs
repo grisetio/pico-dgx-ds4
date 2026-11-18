@@ -571,6 +571,18 @@ fn parse(app: &App, headers: &HeaderMap, body: &Bytes, counting: bool) -> Result
 
 pub async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     let body = if key_ok(&app, &headers) { crate::server::alias_body(&app, &body).unwrap_or(body) } else { body };
+    // a GLM name, while GLM is loaded: gr8's own count (glm.rs `count_tokens`); else DeepSeek's, an estimate
+    if let Some(g) = &app.cfg.glm {
+        if key_ok(&app, &headers) {
+            if let Ok(req) = serde_json::from_slice::<Value>(&body) {
+                if let Some(steered) = g.route(req.get("model").and_then(Value::as_str)) {
+                    if let Some(n) = crate::glm::count_tokens(&app, &req, steered).await {
+                        return (StatusCode::OK, [("content-type", "application/json")], json!({"input_tokens": n}).to_string()).into_response();
+                    }
+                }
+            }
+        }
+    }
     let (_, _, p) = match parse(&app, &headers, &body, true) {
         Ok(x) => x,
         Err(r) => return r,

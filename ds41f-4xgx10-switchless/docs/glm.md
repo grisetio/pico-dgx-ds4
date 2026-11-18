@@ -54,7 +54,9 @@ system reminders kept where they are, reasoning replayed from the signature, `is
 - **Usage.** `input_tokens` = prompt − cached, `cache_read_input_tokens` = gr8's `cached_tokens`.
 - `/v1/chat/completions` with a GLM name goes through to gr8 as it is, with gr8's model name and, for the
   steered name, the steering fields.
-- count_tokens for a GLM name counts with DeepSeek's tokenizer: an estimate.
+- count_tokens for a GLM name, while GLM is loaded, is gr8's own count (its `/tokenize` with the request's
+  messages, tools and template arguments). Otherwise (DeepSeek loaded, a switch running, gr8 not answering in
+  10 s) it counts with DeepSeek's tokenizer, an estimate: counting never switches the engines.
 
 ## Engine switching (src/switch.rs), `--switch-cmd`
 

@@ -350,6 +350,45 @@ pub fn to_gr8(req: &Value, cfg: &GlmConfig, steered: bool) -> Result<Plan, Strin
     })
 }
 
+/// gr8's /tokenize body for a request: the chat request's messages, tools and template arguments (its
+/// effort line opens the prompt), as the prompt gr8 would render, without what only generation uses.
+pub fn tokenize_body(plan: &Plan) -> Value {
+    let mut body = plan.body.clone();
+    if let Some(o) = body.as_object_mut() {
+        for k in ["stream", "stream_options", "max_tokens", "thinking_budget", "tool_choice", "response_format", "steering_profile", "steering_scale"] {
+            o.remove(k);
+        }
+        o.insert("add_generation_prompt".into(), json!(true));
+    }
+    body
+}
+
+/// A GLM request's prompt tokens by gr8's own tokenizer (its /tokenize). None unless GLM is the
+/// engine loaded and gr8 answers within a few seconds: counting never switches the engines, and the
+/// caller falls back to DeepSeek's tokenizer, an estimate.
+pub async fn count_tokens(app: &App, req: &Value, steered: bool) -> Option<u64> {
+    let cfg = app.cfg.glm.as_ref()?;
+    if app.switcher().is_some_and(|s| s.active() != Some(Family::Glm) || s.switching().is_some()) {
+        return None;
+    }
+    let body = tokenize_body(&to_gr8(req, cfg, steered).ok()?);
+    let n = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut u = send(&cfg.url, "POST", "/tokenize", body.to_string()).await.ok()?;
+        if u.status != 200 {
+            return None;
+        }
+        let v: Value = serde_json::from_slice(&u.read_all(1 << 26).await.ok()?).ok()?;
+        v.get("count").and_then(Value::as_u64).or_else(|| v.get("tokens")?.as_array().map(|a| a.len() as u64))
+    })
+    .await
+    .ok()
+    .flatten();
+    if n.is_none() {
+        eprintln!("glm: gr8's /tokenize did not answer; count_tokens estimates with DeepSeek's tokenizer");
+    }
+    n
+}
+
 // ------------------------------------------------------------------ gr8's errors
 
 /// "This model's maximum context length is X tokens. However, you requested Y tokens (P in the
@@ -919,6 +958,22 @@ pub async fn chat(app: Arc<App>, mut req: Value, steered: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenize_body_keeps_the_prompt() {
+        let cfg = cfg();
+        let req = json!({"model": "glm-5.3-jspark", "max_tokens": 100, "stream": true, "stop_sequences": ["x"],
+            "thinking": {"type": "enabled", "budget_tokens": 50}, "output_config": {"effort": "max"},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}], "messages": [{"role": "user", "content": "hi"}]});
+        let b = tokenize_body(&to_gr8(&req, &cfg, true).unwrap());
+        let o = b.as_object().unwrap();
+        for k in ["stream", "stream_options", "max_tokens", "thinking_budget", "steering_profile", "steering_scale"] {
+            assert!(!o.contains_key(k), "{k}");
+        }
+        assert_eq!((&b["reasoning_effort"], &b["add_generation_prompt"]), (&json!("max"), &json!(true)));
+        assert_eq!(b["chat_template_kwargs"], json!({"clear_thinking": false}));
+        assert!(b["messages"].is_array() && b["tools"].is_array());
+    }
 
     pub(crate) fn cfg() -> GlmConfig {
         GlmConfig {
